@@ -1,0 +1,528 @@
+// Package api 提供管理 API 与 OpenAI-compatible 网关 API。
+// 对齐 PRD US-001/003/006/007：单服务、Provider/Account 管理、统一 /v1 转发。
+package api
+
+import (
+	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"midroute/internal/connectors"
+	"midroute/internal/credentials"
+	"midroute/internal/domain"
+	"midroute/internal/errs"
+	"midroute/internal/httpserver"
+	"midroute/internal/repository"
+	"midroute/internal/router"
+)
+
+// App 聚合依赖。
+type App struct {
+	Store  *repository.Store
+	Vault  credentials.Vault
+	Router *router.Router
+	Log    *slog.Logger
+	now    func() string
+}
+
+// NewApp 创建 App。vault 由调用方注入（Keychain 或内存）。
+func NewApp(store *repository.Store, v credentials.Vault, r *router.Router, log *slog.Logger) *App {
+	return &App{Store: store, Vault: v, Router: r, Log: log, now: func() string { return time.Now().UTC().Format(time.RFC3339) }}
+}
+
+// Mount 在基础服务上挂载管理 API 与网关 API。
+func (a *App) Mount(srv *httpserver.Server) {
+	// 管理 API
+	srv.MountFunc("/api/v1/providers", a.handleProviders)
+	srv.MountFunc("/api/v1/accounts", a.handleAccounts)
+	srv.MountFunc("/api/v1/accounts/", a.accountAction)
+	srv.MountFunc("/api/v1/models", a.handleModels)
+	srv.MountFunc("/api/v1/routing-policies", a.handleRoutingPolicies)
+	srv.MountFunc("/api/v1/routing-policies/", a.handleRoutingPolicyByAlias)
+	// OpenAI-compatible 网关
+	srv.MountFunc("/v1/models", a.handleGatewayModels)
+	srv.MountFunc("/v1/chat/completions", a.handleChatCompletions)
+}
+
+// ResolveForRouter 实现 router.Resolver：账户 → 可执行目标。
+func (a *App) ResolveForRouter(ctx context.Context, accountID string) (*router.ResolvedTarget, error) {
+	acc, err := a.Store.GetAccount(ctx, accountID)
+	if err != nil {
+		return nil, err
+	}
+	t, err := a.resolveTarget(ctx, acc, "")
+	if err != nil {
+		return nil, err
+	}
+	return &router.ResolvedTarget{
+		AccountID: acc.ID,
+		ModelID:   t.ModelID,
+		Target:    *t,
+	}, nil
+}
+
+// defaultBaseURL 平台默认地址。
+func defaultBaseURL(kind string) string {
+	switch kind {
+	case "anthropic":
+		return "https://api.anthropic.com"
+	case "gemini":
+		return "https://generativelanguage.googleapis.com"
+	default:
+		return "https://api.openai.com"
+	}
+}
+
+// -------- providers --------
+
+func (a *App) handleProviders(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		list, err := a.Store.ListProviders(r.Context())
+		if err != nil {
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询 Provider 失败", err))
+			return
+		}
+		httpserver.WriteJSON(w, http.StatusOK, map[string]any{"data": list})
+	case http.MethodPost:
+		var in struct {
+			ID      string `json:"id"`
+			Kind    string `json:"kind"`
+			Name    string `json:"name"`
+			BaseURL string `json:"base_url"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "请求体无效"))
+			return
+		}
+		switch in.Kind {
+		case "openai", "anthropic", "gemini", "openai-compatible":
+		default:
+			httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "不支持的 kind: "+in.Kind))
+			return
+		}
+		if in.ID == "" {
+			in.ID = "prov_" + shortID()
+		}
+		if in.Name == "" {
+			in.Name = in.Kind
+		}
+		if in.BaseURL == "" {
+			in.BaseURL = defaultBaseURL(in.Kind)
+		}
+		if err := a.Store.CreateProvider(r.Context(), domain.Provider{
+			ID: in.ID, Kind: in.Kind, Name: in.Name, BaseURL: in.BaseURL,
+		}); err != nil {
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "创建 Provider 失败", err))
+			return
+		}
+		httpserver.WriteJSON(w, http.StatusCreated, map[string]any{"id": in.ID})
+	default:
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
+	}
+}
+
+// -------- accounts --------
+
+func (a *App) handleAccounts(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		list, err := a.Store.ListAccounts(r.Context())
+		if err != nil {
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询账户失败", err))
+			return
+		}
+		httpserver.WriteJSON(w, http.StatusOK, map[string]any{"data": list})
+	case http.MethodPost:
+		a.createAccount(w, r)
+	default:
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
+	}
+}
+
+func (a *App) createAccount(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		ProviderID string `json:"provider_id"`
+		Name       string `json:"name"`
+		APIKey     string `json:"api_key"` // 仅请求体内出现；存储走 SecretRef
+		Mode       string `json:"mode"`    // monitor_only | relay_and_monitor，默认 relay_and_monitor
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "请求体无效"))
+		return
+	}
+	if in.ProviderID == "" || in.APIKey == "" {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "缺少 provider_id 或 api_key"))
+		return
+	}
+	if in.Mode == "" {
+		in.Mode = string(domain.ModeRelayAndMonitor)
+	}
+	if in.Mode != string(domain.ModeMonitorOnly) && in.Mode != string(domain.ModeRelayAndMonitor) {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "mode 仅支持 monitor_only / relay_and_monitor"))
+		return
+	}
+	prov, err := a.Store.GetProvider(r.Context(), in.ProviderID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			httpserver.WriteError(w, errs.New(errs.CodeNotFound, "Provider 不存在"))
+			return
+		}
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询 Provider 失败", err))
+		return
+	}
+	// 密钥写入 Vault，仅保存 SecretRef
+	service := "account-" + in.ProviderID
+	accountID := "acc_" + shortID()
+	ref, err := a.Vault.Store(service, accountID, []byte(in.APIKey))
+	if err != nil {
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "凭据入库失败", err))
+		return
+	}
+	name := in.Name
+	if name == "" {
+		name = prov.Kind + "-" + accountID[:8]
+	}
+	acc := domain.Account{
+		ID: accountID, ProviderID: prov.ID, Name: name, Status: "active",
+		Mode: in.Mode, AuthType: string(domain.AuthAPIKey),
+		BillingMode: string(domain.BillingUnknown), AuthState: string(domain.AuthStateUnknown),
+		VaultProvider: ref.VaultProvider, SecretService: ref.Service, SecretAccount: ref.Account,
+		SecretFingerprint: ref.Fingerprint,
+	}
+	if err := a.Store.CreateAccount(r.Context(), acc); err != nil {
+		_ = a.Vault.Delete(ref)
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "创建账户失败", err))
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusCreated, map[string]any{"id": accountID, "secret_fingerprint": ref.Fingerprint})
+}
+
+// accountAction 处理 /api/v1/accounts/:id/{verify|discover}
+func (a *App) accountAction(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	// [api v1 accounts <id> <action>]
+	if len(parts) != 5 {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "路径无效"))
+		return
+	}
+	accountID := parts[3]
+	action := parts[4]
+	acc, err := a.Store.GetAccount(r.Context(), accountID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			httpserver.WriteError(w, errs.New(errs.CodeNotFound, "账户不存在"))
+			return
+		}
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询账户失败", err))
+		return
+	}
+	target, err := a.resolveTarget(r.Context(), acc, "")
+	if err != nil {
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "解析目标失败", err))
+		return
+	}
+	conn := connectors.NewConnector(target.ProviderKind, connectors.Options{})
+	switch action {
+	case "verify":
+		if err := conn.ValidateCredential(r.Context(), *target); err != nil {
+			_ = a.Store.SetAccountStatus(r.Context(), accountID, "error")
+			httpserver.WriteError(w, errs.Wrap(errs.CodeUpstreamAuth, "凭据校验失败", err))
+			return
+		}
+		at := a.now()
+		_ = a.Store.SetAccountStatus(r.Context(), accountID, "active")
+		_ = a.Store.SetAccountVerifiedAt(r.Context(), accountID, at)
+		httpserver.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "verified_at": at})
+	case "discover":
+		infos, err := conn.DiscoverModels(r.Context(), *target)
+		if err != nil {
+			httpserver.WriteError(w, errs.Wrap(errs.CodeUpstreamError, "模型发现失败", err))
+			return
+		}
+		models := make([]domain.Model, 0, len(infos))
+		rows := make([]repository.ModelInfoRow, 0, len(infos))
+		for _, mi := range infos {
+			models = append(models, domain.Model{ID: provModelID(acc.ProviderID, mi.UpstreamID), ProviderID: acc.ProviderID, UpstreamID: mi.UpstreamID, ContextLimit: mi.ContextLimit})
+			rows = append(rows, repository.ModelInfoRow{ModelID: provModelID(acc.ProviderID, mi.UpstreamID), Listed: true, Usable: true})
+		}
+		if err := a.Store.UpsertModels(r.Context(), models); err != nil {
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "保存模型失败", err))
+			return
+		}
+		if err := a.Store.SaveAccountModels(r.Context(), accountID, rows); err != nil {
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "保存账户模型失败", err))
+			return
+		}
+		httpserver.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "count": len(infos)})
+	default:
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "不支持的动作: "+action))
+	}
+}
+
+// -------- models --------
+
+func (a *App) handleModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
+		return
+	}
+	list, err := a.Store.ListModels(r.Context())
+	if err != nil {
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询模型失败", err))
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, map[string]any{"data": list})
+}
+
+// -------- routing policies --------
+
+func (a *App) handleRoutingPolicies(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
+		return
+	}
+	list, err := a.Store.ListRoutingPolicies(r.Context())
+	if err != nil {
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询路由策略失败", err))
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, map[string]any{"data": list})
+}
+
+func (a *App) handleRoutingPolicyByAlias(w http.ResponseWriter, r *http.Request) {
+	alias := strings.TrimPrefix(r.URL.Path, "/api/v1/routing-policies/")
+	if alias == "" {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "缺少别名"))
+		return
+	}
+	if r.Method != http.MethodPut && r.Method != http.MethodPost {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
+		return
+	}
+	var in struct {
+		ID         string             `json:"id"`
+		Name       string             `json:"name"`
+		Candidates []domain.Candidate `json:"candidates"`
+		Enabled    bool               `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "请求体无效"))
+		return
+	}
+	if len(in.Candidates) == 0 {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "缺少 candidates"))
+		return
+	}
+	id := in.ID
+	if id == "" {
+		id = "pol_" + shortID()
+	}
+	p := domain.RoutingPolicy{ID: id, Name: in.Name, Alias: alias, Candidates: in.Candidates, Enabled: in.Enabled}
+	if err := a.Store.SaveRoutingPolicy(r.Context(), p); err != nil {
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "保存路由策略失败", err))
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, map[string]any{"id": id})
+}
+
+// -------- 网关 --------
+
+func (a *App) handleGatewayModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
+		return
+	}
+	list, err := a.Store.ListModels(r.Context())
+	if err != nil {
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询模型失败", err))
+		return
+	}
+	type m struct {
+		ID      string `json:"id"`
+		Object  string `json:"object"`
+		Created int64  `json:"created"`
+		OwnedBy string `json:"owned_by"`
+	}
+	ids := make([]m, 0, len(list))
+	for _, mm := range list {
+		ids = append(ids, m{ID: mm.UpstreamID, Object: "model", Created: time.Now().Unix(), OwnedBy: mm.ProviderID})
+	}
+	httpserver.WriteJSON(w, http.StatusOK, map[string]any{"object": "list", "data": ids})
+}
+
+func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
+		return
+	}
+	var req connectors.ChatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "请求体无效"))
+		return
+	}
+	if req.Model == "" || len(req.Messages) == 0 {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "缺少 model 或 messages"))
+		return
+	}
+	requestID := "req_" + shortID()
+	if req.Stream {
+		a.streamChat(w, r, &req, requestID)
+		return
+	}
+	start := time.Now()
+	resp, decision, err := a.Router.Forward(r.Context(), req.Model, &req, requestID)
+	latency := time.Since(start).Milliseconds()
+	if err != nil {
+		a.logError(decision, err)
+		a.recordUsage(r, requestID, req.Model, decision, nil, latency, errs.From(err).Code)
+		httpserver.WriteError(w, a.mapRelayError(err))
+		return
+	}
+	a.recordUsage(r, requestID, req.Model, decision, resp.Usage, latency, "")
+	if resp.ID == "" {
+		resp.ID = "chatcmpl-" + requestID
+	}
+	resp.Model = req.Model
+	httpserver.WriteJSON(w, http.StatusOK, resp)
+}
+
+// recordUsage 记录请求用量元数据（不保存正文；FR-12/FR-13）。
+func (a *App) recordUsage(r *http.Request, requestID, model string, decision *router.Decision, usage *connectors.UsageDTO, latencyMS int64, errCode errs.Code) {
+	ev := repository.UsageEvent{
+		ID:         "ue_" + shortID(),
+		RequestID:  requestID,
+		ModelID:    model,
+		StatusCode: 200,
+		LatencyMS:  latencyMS,
+		ErrorClass: string(errCode),
+	}
+	if errCode != "" {
+		ev.StatusCode = errs.New(errCode, "").HTTPStatus()
+	}
+	if usage != nil {
+		ev.InputTokens = usage.PromptTokens
+		ev.OutputTokens = usage.CompletionTokens
+		if usage.PromptTokensDetails != nil {
+			ev.CacheTokens = usage.PromptTokensDetails.CachedTokens
+		}
+	}
+	if decision != nil {
+		if i := strings.Index(decision.Selected, "@"); i > 0 {
+			ev.AccountID = decision.Selected[:i]
+		}
+	}
+	_ = a.Store.RecordUsageEvent(r.Context(), ev)
+}
+
+func (a *App) streamChat(w http.ResponseWriter, r *http.Request, req *connectors.ChatRequest, requestID string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		httpserver.WriteError(w, errs.New(errs.CodeInternal, "不支持流式"))
+		return
+	}
+	w.Header().Set("content-type", "text/event-stream")
+	w.Header().Set("cache-control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	start := time.Now()
+	started := false
+	usage, decision, err := a.Router.ForwardStream(r.Context(), req.Model, req, requestID, func(b []byte) error {
+		started = true
+		_, err := w.Write(b)
+		if err == nil {
+			flusher.Flush()
+		}
+		return err
+	})
+	latency := time.Since(start).Milliseconds()
+	if err != nil && !started {
+		// 尚未输出任何内容，可回写错误事件
+		_ = usage
+		a.recordUsage(r, requestID, req.Model, decision, nil, latency, errs.From(err).Code)
+		w.Write([]byte("data: {\"error\":{\"code\":\"upstream_error\",\"message\":\"" + err.Error() + "\"}}\n\n"))
+		flusher.Flush()
+		return
+	}
+	if err != nil {
+		a.logError(decision, err)
+	}
+	var usageDTO *connectors.UsageDTO
+	if usage != nil {
+		usageDTO = &connectors.UsageDTO{
+			PromptTokens: usage.InputTokens, CompletionTokens: usage.OutputTokens, TotalTokens: usage.InputTokens + usage.OutputTokens,
+		}
+	}
+	a.recordUsage(r, requestID, req.Model, decision, usageDTO, latency, "")
+	w.Write([]byte("data: [DONE]\n\n"))
+	flusher.Flush()
+}
+
+// mapRelayError 将中继错误映射为稳定错误。
+func (a *App) mapRelayError(err error) *errs.Error {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "no usable candidate"):
+		return errs.New(errs.CodeModelUnavailable, "没有可用渠道")
+	case strings.Contains(msg, "upstream auth"):
+		return errs.New(errs.CodeUpstreamAuth, "上游鉴权失败")
+	case strings.Contains(msg, "upstream rate_limited"), strings.Contains(msg, "429"):
+		return errs.Retryable(errs.New(errs.CodeRateLimited, "上游限流"))
+	case strings.Contains(msg, "upstream 5xx"), strings.Contains(msg, "timeout"):
+		return errs.Retryable(errs.New(errs.CodeUpstreamError, "上游异常"))
+	default:
+		return errs.Wrap(errs.CodeUpstreamError, "转发失败", err)
+	}
+}
+
+func (a *App) logError(decision *router.Decision, err error) {
+	if a.Log != nil && err != nil {
+		a.Log.Error("relay failed", "request_id", decision.RequestID, "alias", decision.Alias, "err", err)
+	}
+}
+
+// resolveTarget 解析账户目标（含凭据解密）。
+func (a *App) resolveTarget(ctx context.Context, acc domain.Account, modelID string) (*connectors.Target, error) {
+	prov, err := a.Store.GetProvider(ctx, acc.ProviderID)
+	if err != nil {
+		return nil, err
+	}
+	if acc.Status != "active" {
+		return nil, fmt.Errorf("账户不可用: %s", acc.Status)
+	}
+	sec, err := a.Vault.Get(credentials.SecretRef{
+		Service: acc.SecretService, Account: acc.SecretAccount, VaultProvider: acc.VaultProvider,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer sec.Zero()
+	base := prov.BaseURL
+	if base == "" {
+		base = defaultBaseURL(prov.Kind)
+	}
+	return &connectors.Target{
+		ProviderKind: connectors.ProviderKind(prov.Kind),
+		BaseURL:      base,
+		APIKey:       string(sec.Value),
+		ModelID:      modelID,
+	}, nil
+}
+
+func provModelID(providerID, upstreamID string) string {
+	return providerID + "|" + upstreamID
+}
+
+// shortID 生成随机短 ID。
+func shortID() string {
+	b := make([]byte, 6)
+	if _, err := rand.Read(b); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return fmt.Sprintf("%x", b)
+}

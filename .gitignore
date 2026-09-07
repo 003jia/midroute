@@ -1,0 +1,23 @@
+# Build output
+/dist/
+dist/
+node_modules/
+
+# Local config / runtime data
+/config.local.yaml
+/smoke-config.yaml
+/data/
+/backups/
+*.log
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Upstream clones keep their own git; integration repo treats them as external pinned deps
+# work/ is NOT committed here. See PINNED_COMMITS for freeze metadata.
+/work/

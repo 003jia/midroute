@@ -1,0 +1,77 @@
+:root {
+  font-family: system-ui, -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+  color-scheme: light dark;
+  --bg: #f5f6f8;
+  --fg: #1f2328;
+  --muted: #59636e;
+  --accent: #2f6fed;
+  --card: #ffffff;
+  --border: #d8dee4;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117;
+    --fg: #e6edf3;
+    --muted: #9198a1;
+    --accent: #4493f8;
+    --card: #161b22;
+    --border: #30363d;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.app {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+}
+
+h1 {
+  margin: 0 0 0.25rem;
+  font-size: 1.5rem;
+}
+
+.subtitle {
+  margin: 0 0 1.5rem;
+  color: var(--muted);
+}
+
+nav {
+  display: flex;
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+}
+
+nav a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.status-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+}
+
+.status-card ul {
+  margin: 0;
+  padding-left: 1.25rem;
+  line-height: 1.8;
+}
+
+.error {
+  color: #d1242f;
+}

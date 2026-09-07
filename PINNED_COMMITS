@@ -1,0 +1,20 @@
+# 上游冻结版本（2026-09-03 冻结，M0 验收通过）
+# 升级流程：先运行 build/sync-upstream.sh 评估差异，评审通过后更新以下提交号并重新冻结。
+
+GATEWAY=CLIProxyAPI
+GATEWAY_REPO=https://github.com/router-for-me/CLIProxyAPI.git
+GATEWAY_COMMIT=17a65ee5470fbaf0e22fc219381e6a4ae9e07624
+GATEWAY_DATE=2026-09-01T18:12:39+08:00
+GATEWAY_SUBJECT="fix(codex): support reasoning_text in openai chat completion responses"
+
+MANAGER=CPA-Manager-Plus
+MANAGER_REPO=https://github.com/seakee/CPA-Manager-Plus.git
+MANAGER_COMMIT=be3039b66917a13e91b51660ecc10c08dca4862a
+MANAGER_DATE=2026-08-31T08:53:21+08:00
+MANAGER_SUBJECT="Merge pull request #660 from seakee/dev"
+
+ONEAPI=one-api
+ONEAPI_REPO=https://github.com/songquanpeng/one-api.git
+ONEAPI_COMMIT=8df4a2670b98266bd287c698243fff327d9748cf
+ONEAPI_DATE=2025-02-21T19:30:16+08:00
+ONEAPI_SUBJECT="docs: update ByteDance Doubao model link in README"
