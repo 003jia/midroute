@@ -129,7 +129,7 @@ P0 · 部分实现 · 对应 M0/M1、US-001/002 · 依赖：无。
 
 - [x] 从根目录执行 test/build 入口均成功；test 包含全部自有 Go 包，无空模块掩盖漏测。（2026-09-08：test.sh 已加入 go vet；实跑 test.sh/build.sh 通过；仓库仅 `apps/server` 一个 Go 模块，无空模块）
 - [x] 冒烟只清理本次临时目录且不占用已有实例；页面成功断言由 MR-002 加入并验收，构建清单无旧上游服务。（2026-09-08：smoke-test.sh 使用 mktemp+trap 清理，含 /、未知 API JSON 404 断言；dist/ 无 cli-proxy-api/cpa-manager-server/one-api）
-- [ ] 初始提交仅含审查过的源码、锁文件和文档，可回到本次基线。
+- [x] 初始提交仅含审查过的源码、锁文件和文档，可回到本次基线。（2026-09-08：a8ae51a；提交前通过 secret-scan，data/、backups/、work/ 均被 .gitignore 排除）
 
 ### MR-002 单服务管理页与访问边界
 
