@@ -45,8 +45,10 @@ func (e *Error) Unwrap() error { return e.Err }
 // HTTPStatus 返回错误对应的 HTTP 状态码。
 func (e *Error) HTTPStatus() int {
 	switch e.Code {
-	case CodeInvalidRequest, CodeUnsupported, CodeConflict:
+	case CodeInvalidRequest, CodeUnsupported:
 		return http.StatusBadRequest
+	case CodeConflict:
+		return http.StatusConflict
 	case CodeUnauthorized, CodeUpstreamAuth:
 		return http.StatusUnauthorized
 	case CodeForbidden:

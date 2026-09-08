@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -12,6 +14,7 @@ import (
 
 	"midroute/internal/connectors"
 	"midroute/internal/credentials"
+	"midroute/internal/domain"
 	"midroute/internal/httpserver"
 	"midroute/internal/router"
 	"midroute/internal/session"
@@ -141,6 +144,150 @@ func TestFullFlowWithMockOpenAIUpstream(t *testing.T) {
 	decodeBody(t, resp, &mlist)
 	if mlist.Object != "list" || len(mlist.Data) == 0 {
 		t.Fatalf("v1/models=%+v", mlist)
+	}
+}
+
+// MR-004：账户/Provider 生命周期（编辑、禁用、删除冲突、审计）。
+func TestAccountLifecycle(t *testing.T) {
+	ts, app := buildServer(t)
+	base := ts.URL
+	ctx := context.Background()
+
+	resp := mustPost(t, base+"/api/v1/providers",
+		`{"kind":"openai","name":"p","base_url":"http://127.0.0.1:1"}`)
+	var prov struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, resp, &prov)
+	resp, _ = http.Post(base+"/api/v1/accounts", "application/json",
+		strings.NewReader(`{"provider_id":"`+prov.ID+`","api_key":"sk-test-abcdefghijklmnopqrstuvwxyz123456","name":"main"}`))
+	var acc struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, resp, &acc)
+
+	// 编辑名称 + 禁用
+	req := mustReq(t, http.MethodPatch, base+"/api/v1/accounts/"+acc.ID, `{"name":"改名","status":"disabled"}`)
+	resp, _ = http.DefaultClient.Do(req)
+	if resp.StatusCode != 200 {
+		t.Fatalf("patch: %d", resp.StatusCode)
+	}
+	var updated struct {
+		Name   string `json:"name"`
+		Status string `json:"status"`
+	}
+	decodeBody(t, resp, &updated)
+	if updated.Name != "改名" || updated.Status != "disabled" {
+		t.Fatalf("updated=%+v", updated)
+	}
+
+	// 禁用后不参与路由
+	if _, _, err := app.Router.Forward(ctx, "none", connectors.NewChatRequest("none", nil), "r"); err == nil {
+		t.Fatal("no policy should error")
+	}
+
+	// 被路由策略引用时删除 → 409
+	app.Store.SaveRoutingPolicy(ctx, mkPolicy("pol1", acc.ID))
+	req = mustReq(t, http.MethodDelete, base+"/api/v1/accounts/"+acc.ID, "")
+	resp, _ = http.DefaultClient.Do(req)
+	if resp.StatusCode != 409 {
+		t.Fatalf("delete referenced account: want 409 got %d", resp.StatusCode)
+	}
+
+	// 解除引用后删除成功
+	if err := app.Store.DeleteRoutingPolicy(ctx, "pol1"); err != nil {
+		t.Fatal(err)
+	}
+	req = mustReq(t, http.MethodDelete, base+"/api/v1/accounts/"+acc.ID, "")
+	resp, _ = http.DefaultClient.Do(req)
+	if resp.StatusCode != 200 {
+		t.Fatalf("delete: %d", resp.StatusCode)
+	}
+
+	// Provider 被账户引用 → 409
+	resp, _ = http.Post(base+"/api/v1/accounts", "application/json",
+		strings.NewReader(`{"provider_id":"`+prov.ID+`","api_key":"sk-test-abcdefghijklmnopqrstuvwxyz123456"}`))
+	decodeBody(t, resp, &acc)
+	req = mustReq(t, http.MethodDelete, base+"/api/v1/providers/"+prov.ID, "")
+	resp, _ = http.DefaultClient.Do(req)
+	if resp.StatusCode != 409 {
+		t.Fatalf("delete referenced provider: want 409 got %d", resp.StatusCode)
+	}
+
+	// 审计事件已记录
+	if auditN, _ := app.Store.CountAuditEvents(context.Background()); auditN == 0 {
+		t.Fatal("audit events missing")
+	}
+}
+
+// MR-016/M2：Token 数据模型 —— 创建只回一次明文、列表不泄露哈希、启停生效。
+func TestTokenLifecycle(t *testing.T) {
+	ts, app := buildServer(t)
+	base := ts.URL
+
+	resp := mustPost(t, base+"/api/v1/tokens", `{"name":"我的令牌"}`)
+	if resp.StatusCode != 201 {
+		t.Fatalf("create: %d", resp.StatusCode)
+	}
+	var created struct {
+		ID     string `json:"id"`
+		Token  string `json:"token"`
+		Prefix string `json:"key_prefix"`
+	}
+	decodeBody(t, resp, &created)
+	if !strings.HasPrefix(created.Token, "mrt_") || created.Prefix == "" {
+		t.Fatalf("created=%+v", created)
+	}
+
+	// 明文可被哈希命中（用于推理鉴权）
+	sum := sha256.Sum256([]byte(created.Token))
+	tok, err := app.Store.FindTokenByKeyHash(context.Background(), fmt.Sprintf("%x", sum))
+	if err != nil || !tok.Enabled {
+		t.Fatalf("hash lookup failed: %v", err)
+	}
+
+	// 列表不泄露哈希与明文
+	resp, _ = http.Get(base + "/api/v1/tokens")
+	var list struct {
+		Data []struct {
+			ID      string `json:"id"`
+			KeyHash string `json:"key_hash"`
+		} `json:"data"`
+	}
+	decodeBody(t, resp, &list)
+	if len(list.Data) != 1 || list.Data[0].KeyHash != "" {
+		t.Fatalf("list leaks: %+v", list.Data)
+	}
+
+	// 禁用后不可用
+	req := mustReq(t, http.MethodPatch, base+"/api/v1/tokens/"+created.ID, `{"enabled":false}`)
+	resp, _ = http.DefaultClient.Do(req)
+	if resp.StatusCode != 200 {
+		t.Fatalf("disable: %d", resp.StatusCode)
+	}
+	sum2 := sha256.Sum256([]byte(created.Token))
+	tok, _ = app.Store.FindTokenByKeyHash(context.Background(), fmt.Sprintf("%x", sum2))
+	if tok.Enabled {
+		t.Fatal("token should be disabled")
+	}
+
+	// 删除
+	req = mustReq(t, http.MethodDelete, base+"/api/v1/tokens/"+created.ID, "")
+	resp, _ = http.DefaultClient.Do(req)
+	if resp.StatusCode != 200 {
+		t.Fatalf("delete: %d", resp.StatusCode)
+	}
+	sum3 := sha256.Sum256([]byte(created.Token))
+	if _, err := app.Store.FindTokenByKeyHash(context.Background(), fmt.Sprintf("%x", sum3)); err == nil {
+		t.Fatal("deleted token must not be found")
+	}
+}
+
+func mkPolicy(id, accountID string) domain.RoutingPolicy {
+	return domain.RoutingPolicy{
+		ID: id, Name: id, Alias: "alias-" + id,
+		Candidates: []domain.Candidate{{AccountID: accountID, ModelID: "gpt-4o", Priority: 1, Weight: 1}},
+		Enabled:    true,
 	}
 }
 

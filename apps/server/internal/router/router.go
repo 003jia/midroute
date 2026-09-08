@@ -91,7 +91,7 @@ func (r *Router) defaultCandidates(ctx context.Context, model string) ([]domain.
 	}
 	var cands []domain.Candidate
 	for _, a := range accounts {
-		if a.Status != "active" {
+		if a.Status != "active" || a.Mode == string(domain.ModeMonitorOnly) {
 			continue
 		}
 		// 简单判断：账户可用模型表中存在该模型
@@ -110,7 +110,14 @@ func (r *Router) accountUsable(ctx context.Context, accountID string) (bool, err
 	if err != nil {
 		return false, err
 	}
-	return a.Status == "active", nil
+	if a.Status != "active" {
+		return false, nil
+	}
+	// 仅监测账户永不成为路由候选（合约 v1 §accounts.mode；MR-004）
+	if a.Mode == string(domain.ModeMonitorOnly) {
+		return false, nil
+	}
+	return true, nil
 }
 
 func (r *Router) accountHasModel(ctx context.Context, accountID, modelID string) (bool, error) {
@@ -166,6 +173,11 @@ func (r *Router) ForwardStream(ctx context.Context, alias string, req *connector
 	decision := &Decision{RequestID: requestID, Alias: alias, PolicyID: policyID, CreatedAt: time.Now().Unix()}
 	var lastErr error = ErrNoCandidate
 	streamed := false
+	// 包装回调：记录是否已向客户端输出过内容（一旦输出，禁止重放）
+	wrapped := func(b []byte) error {
+		streamed = true
+		return onChunk(b)
+	}
 	for _, c := range cands {
 		target, err := r.resolve(ctx, c.AccountID)
 		if err != nil {
@@ -178,7 +190,7 @@ func (r *Router) ForwardStream(ctx context.Context, alias string, req *connector
 		decision.Candidates = append(decision.Candidates, decision.Selected)
 		upstreamReq := *req
 		upstreamReq.Model = c.ModelID
-		usage, err := target.Conn.ForwardStream(ctx, target.Target, &upstreamReq, onChunk)
+		usage, err := target.Conn.ForwardStream(ctx, target.Target, &upstreamReq, wrapped)
 		if err == nil {
 			decision.ReasonCodes = append(decision.ReasonCodes, "ok")
 			return usage, decision, nil
@@ -186,7 +198,7 @@ func (r *Router) ForwardStream(ctx context.Context, alias string, req *connector
 		lastErr = err
 		decision.ReasonCodes = append(decision.ReasonCodes, "failover:"+err.Error())
 		if streamed {
-			break // 已输出内容，禁止重放
+			break // 已输出内容，禁止重放（US-006）
 		}
 		if !safeToRetry(err) {
 			break
@@ -204,7 +216,7 @@ func safeToRetry(err error) bool {
 	if strings.Contains(msg, "rate_limited") || strings.Contains(msg, "429") {
 		return true
 	}
-	if strings.Contains(msg, "timeout") || strings.Contains(msg, "5xx") {
+	if strings.Contains(msg, "timeout") || strings.Contains(msg, "5xx") || strings.Contains(msg, "truncated") {
 		return true
 	}
 	if strings.Contains(msg, "connection") || strings.Contains(msg, "TLS") || strings.Contains(msg, "EOF") {

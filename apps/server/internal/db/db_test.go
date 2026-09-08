@@ -40,6 +40,53 @@ func TestMigrateAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestMigrateFailureRollsBack(t *testing.T) {
+	// 注入一条必然失败的迁移，验证：报错、版本不推进、部分写入回滚（MR-003）。
+	orig := Migrations
+	defer func() { Migrations = orig }()
+	Migrations = append([]Migration{}, orig...)
+	Migrations = append(Migrations, Migration{
+		Version: 99,
+		Name:    "boom",
+		Up: `
+CREATE TABLE rollback_probe(id TEXT PRIMARY KEY);
+INSERT INTO rollback_probe VALUES('a');  -- ok
+INSERT INTO missing_table VALUES('x');   -- 失败
+`,
+	})
+
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "fail.db")
+	conn, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	v, err := Migrate(ctx, conn)
+	if err == nil {
+		t.Fatal("expected migration failure")
+	}
+	if v != 3 { // 前三个版本成功
+		t.Fatalf("version=%d want 3", v)
+	}
+	// 失败版本未记录
+	var n int
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM schema_migrations WHERE version=99`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatal("failed migration must not be recorded")
+	}
+	// 事务回滚：boom 内先创建的表不存在
+	if err := conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE name='rollback_probe'`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatal("rollback_probe must be rolled back")
+	}
+}
+
 func TestOpenCreatesWAL(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "wal.db")
@@ -135,8 +182,8 @@ func TestMigrateV1ToV2PreservesData(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upgrade v1->v2: %v", err)
 	}
-	if v != 2 {
-		t.Fatalf("version=%d, want 2", v)
+	if v < 2 {
+		t.Fatalf("version=%d, want >= 2", v)
 	}
 	var name, mode, authType, billingMode, authState string
 	if err := conn.QueryRowContext(ctx,

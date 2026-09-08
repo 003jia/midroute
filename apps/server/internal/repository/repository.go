@@ -58,6 +58,28 @@ func (s *Store) GetProvider(ctx context.Context, id string) (domain.Provider, er
 	return p, err
 }
 
+// UpdateProvider 更新 Provider 名称/地址（MR-004）。
+func (s *Store) UpdateProvider(ctx context.Context, id string, name, baseURL *string) error {
+	p, err := s.GetProvider(ctx, id)
+	if err != nil {
+		return err
+	}
+	if name != nil && *name != "" {
+		p.Name = *name
+	}
+	if baseURL != nil && *baseURL != "" {
+		p.BaseURL = *baseURL
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE providers SET name=?, base_url=?, updated_at=? WHERE id=?`, p.Name, p.BaseURL, now(), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // -------- accounts --------
 
 // CreateAccount 插入 Account（仅存 SecretRef 引用）。
@@ -132,6 +154,18 @@ func (s *Store) UpdateAccountSecretRef(ctx context.Context, id string, ref domai
 func (s *Store) SetAccountVerifiedAt(ctx context.Context, id, at string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE accounts SET last_verified_at=?, updated_at=? WHERE id=?`, at, now(), id)
 	return err
+}
+
+// SetAccountName 更新账户名称。
+func (s *Store) SetAccountName(ctx context.Context, id, name string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE accounts SET name=?, updated_at=? WHERE id=?`, name, now(), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // -------- models --------
@@ -257,6 +291,25 @@ func (s *Store) ListRoutingPolicies(ctx context.Context) ([]domain.RoutingPolicy
 	return out, rows.Err()
 }
 
+// DeleteRoutingPolicy 删除路由策略（upsert by id）。
+func (s *Store) DeleteRoutingPolicy(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM routing_policies WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// CountAuditEvents 统计审计事件数（测试/巡检用）。
+func (s *Store) CountAuditEvents(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_events`).Scan(&n)
+	return n, err
+}
+
 // GetRoutingPolicyByAlias 按逻辑模型名查路由策略。
 func (s *Store) GetRoutingPolicyByAlias(ctx context.Context, alias string) (domain.RoutingPolicy, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, name, alias, candidates, enabled FROM routing_policies WHERE alias=?`, alias)
@@ -304,4 +357,164 @@ type UsageEvent struct {
 	StatusCode      int
 	LatencyMS       int64
 	ErrorClass      string
+}
+
+// -------- access_tokens --------
+
+// CreateToken 写入推理令牌（只存哈希与前缀）。
+func (s *Store) CreateToken(ctx context.Context, t domain.Token) error {
+	enabled := 0
+	if t.Enabled {
+		enabled = 1
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO access_tokens(id, name, key_hash, key_prefix, enabled, created_at, last_used_at)
+		VALUES(?,?,?,?,?,?,?)`,
+		t.ID, t.Name, t.KeyHash, t.KeyPrefix, enabled, t.CreatedAt, t.LastUsedAt)
+	return err
+}
+
+// ListTokens 列出令牌（不含哈希原文）。
+func (s *Store) ListTokens(ctx context.Context) ([]domain.Token, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, key_prefix, enabled, created_at, last_used_at FROM access_tokens ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []domain.Token{}
+	for rows.Next() {
+		var t domain.Token
+		var enabled int
+		if err := rows.Scan(&t.ID, &t.Name, &t.KeyPrefix, &enabled, &t.CreatedAt, &t.LastUsedAt); err != nil {
+			return nil, err
+		}
+		t.Enabled = enabled == 1
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// SetTokenEnabled 启用/禁用令牌。
+func (s *Store) SetTokenEnabled(ctx context.Context, id string, enabled bool) error {
+	e := 0
+	if enabled {
+		e = 1
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE access_tokens SET enabled=? WHERE id=?`, e, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// DeleteToken 删除令牌。
+func (s *Store) DeleteToken(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM access_tokens WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// FindTokenByKeyHash 按哈希查找启用的令牌。
+func (s *Store) FindTokenByKeyHash(ctx context.Context, keyHash string) (domain.Token, error) {
+	var t domain.Token
+	var enabled int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, name, key_prefix, enabled, created_at, last_used_at FROM access_tokens WHERE key_hash=?`, keyHash).
+		Scan(&t.ID, &t.Name, &t.KeyPrefix, &enabled, &t.CreatedAt, &t.LastUsedAt)
+	if err != nil {
+		return domain.Token{}, err
+	}
+	t.Enabled = enabled == 1
+	return t, nil
+}
+
+// TouchToken 更新最近使用时间。
+func (s *Store) TouchToken(ctx context.Context, id string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE access_tokens SET last_used_at=? WHERE id=?`, now(), id)
+	return err
+}
+
+// -------- 审计 --------
+
+// RecordAuditEvent 记录管理操作审计（不含密钥）。
+func (s *Store) RecordAuditEvent(ctx context.Context, actor, action, target, detail string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO audit_events(id, actor, action, target, detail, occurred_at)
+		VALUES(?,?,?,?,?,?)`,
+		"aud_"+fmt.Sprintf("%d", time.Now().UnixNano()), actor, action, target, detail, now())
+	return err
+}
+
+// -------- 引用计数（删除冲突检查，MR-004）--------
+
+// CountAccountsByProvider 统计某 Provider 下的账户数。
+func (s *Store) CountAccountsByProvider(ctx context.Context, providerID string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM accounts WHERE provider_id=?`, providerID).Scan(&n)
+	return n, err
+}
+
+// DeleteAccount 删除账户（无历史引用时）。
+func (s *Store) DeleteAccount(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM accounts WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// DeleteProvider 删除 Provider。
+func (s *Store) DeleteProvider(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM providers WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// CountUsageEventsByAccount 统计账户历史用量事件数。
+func (s *Store) CountUsageEventsByAccount(ctx context.Context, accountID string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM usage_events WHERE account_id=?`, accountID).Scan(&n)
+	return n, err
+}
+
+// CountRoutingCandidatesByAccount 统计路由策略中引用某账户的候选数。
+func (s *Store) CountRoutingCandidatesByAccount(ctx context.Context, accountID string) (int, error) {
+	var n int
+	rows, err := s.db.QueryContext(ctx, `SELECT candidates FROM routing_policies`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cands string
+		if err := rows.Scan(&cands); err != nil {
+			return 0, err
+		}
+		var list []domain.Candidate
+		if err := json.Unmarshal([]byte(cands), &list); err != nil {
+			continue
+		}
+		for _, c := range list {
+			if c.AccountID == accountID {
+				n++
+			}
+		}
+	}
+	return n, rows.Err()
 }

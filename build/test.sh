@@ -5,6 +5,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+echo "==> apps/server go vet"
+(
+  cd "$ROOT/apps/server"
+  go vet ./...
+)
+
 echo "==> apps/server go test"
 (
   cd "$ROOT/apps/server"

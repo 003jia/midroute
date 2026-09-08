@@ -103,6 +103,22 @@ func TestOpenAICompatibleStreamPassthrough(t *testing.T) {
 	}
 }
 
+// 截断的流（无 [DONE] 结束标记）必须报错，不得静默当成功。
+func TestOpenAICompatibleStreamTruncated(t *testing.T) {
+	srv := serve(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/event-stream")
+		io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"半\"}}]}\n\n")
+		// 连接中断，无 [DONE]
+	})
+	c := NewOpenAICompatibleConnector(srv.Client(), KindOpenAI)
+	_, err := c.ForwardStream(context.Background(), Target{BaseURL: srv.URL, APIKey: "k"}, chatReq("gpt-4o"), func(b []byte) error {
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "truncated") {
+		t.Fatalf("want truncated error, got %v", err)
+	}
+}
+
 func TestAnthropicForwardTranslation(t *testing.T) {
 	var got map[string]any
 	srv := serve(t, func(w http.ResponseWriter, r *http.Request) {
@@ -195,7 +211,7 @@ func TestGeminiStreamTranslation(t *testing.T) {
 	srv := serve(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("content-type", "text/event-stream")
 		io.WriteString(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"片\"}]}}]}\n\n")
-		io.WriteString(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"段\"}]}}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":3}}\n\n")
+		io.WriteString(w, "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"段\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":5,\"candidatesTokenCount\":3}}\n\n")
 		io.WriteString(w, "data: [DONE]\n\n")
 	})
 	c := NewGeminiConnector(srv.Client())

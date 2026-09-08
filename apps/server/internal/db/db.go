@@ -38,6 +38,23 @@ ALTER TABLE accounts ADD COLUMN auth_state TEXT NOT NULL DEFAULT 'unknown';
 CREATE UNIQUE INDEX idx_models_provider_upstream ON models(provider_id, upstream_id);
 `,
 	},
+	{
+		Version: 3,
+		Name:    "access_tokens",
+		Up: `
+-- 推理访问令牌（PRD M2 Token 数据模型；MR-016）
+-- 只保存 SHA-256 哈希与前缀，明文仅在创建响应中出现一次。
+CREATE TABLE access_tokens (
+	id          TEXT PRIMARY KEY,
+	name        TEXT NOT NULL,
+	key_hash    TEXT NOT NULL UNIQUE,
+	key_prefix  TEXT NOT NULL DEFAULT '',
+	enabled     INTEGER NOT NULL DEFAULT 1,
+	created_at  TEXT NOT NULL,
+	last_used_at TEXT NOT NULL DEFAULT ''
+);
+`,
+	},
 }
 
 // KnownVersion 当前程序支持的最高 schema 版本。

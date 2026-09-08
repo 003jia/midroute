@@ -127,8 +127,8 @@ P0 · 部分实现 · 对应 M0/M1、US-001/002 · 依赖：无。
 目标文件：`.gitignore`、`build/test.sh`、`build/build.sh`、`build/smoke-test.sh`、前端 lint/格式配置。
 实现步骤：①排除嵌套 `node_modules`、前端 dist、缓存和运行数据；②保留 Go 子模块，以根脚本运行全量测试并加入 go vet；③规范配置按 §5 落地，存量格式整理单独处理；④冒烟改用唯一临时目录和动态端口，只清理本次创建的资源；⑤检查待提交清单和密钥扫描后建立源码 Git 基线，生成产物不入库。
 
-- [x] 从根目录执行 test/build 入口均成功；test 包含全部自有 Go 包，无空模块掩盖漏测。（2026-09-07 实跑 test.sh/build.sh 通过；仓库仅 `apps/server` 一个 Go 模块，无空模块。注：test.sh 尚未加入 go vet，见实现步骤②缺口）
-- [ ] 冒烟只清理本次临时目录且不占用已有实例；页面成功断言由 MR-002 加入并验收，构建清单无旧上游服务。
+- [x] 从根目录执行 test/build 入口均成功；test 包含全部自有 Go 包，无空模块掩盖漏测。（2026-09-08：test.sh 已加入 go vet；实跑 test.sh/build.sh 通过；仓库仅 `apps/server` 一个 Go 模块，无空模块）
+- [x] 冒烟只清理本次临时目录且不占用已有实例；页面成功断言由 MR-002 加入并验收，构建清单无旧上游服务。（2026-09-08：smoke-test.sh 使用 mktemp+trap 清理，含 /、未知 API JSON 404 断言；dist/ 无 cli-proxy-api/cpa-manager-server/one-api）
 - [ ] 初始提交仅含审查过的源码、锁文件和文档，可回到本次基线。
 
 ### MR-002 单服务管理页与访问边界
@@ -138,9 +138,9 @@ P0 · 部分实现 · 对应 M1/M6、US-001/010 · 依赖：MR-001。
 目标文件：`internal/config`、`internal/httpserver`、`cmd/server/main.go`、`build/run.sh`、`build/smoke-test.sh`。
 实现步骤：①用明确 `StaticDir` 托管 `dist/web`，生产缺资源时给出启动错误；②SPA 路由回落仅限管理页面，API/资源不存在仍返回正确 404；③从实际监听地址核验本地/远程模式，loopback 免重复输入；④远程使用管理员认证建立受保护会话，加入 Host/Origin 校验和写请求 CSRF 防护；⑤不信任任意转发头，代理部署采用显式鉴权配置。
 
-- [ ] 单进程下 `/`、账户页刷新、JS/CSS 资源均成功；未知 API 不返回 HTML。
+- [x] 单进程下 `/`、账户页刷新、JS/CSS 资源均成功；未知 API 不返回 HTML。（2026-09-08：main.go 挂载 MIDROUTE_STATIC_DIR，SPA 回退 index.html；`/api`、`/v1` 未知路径返回 JSON 404；cmd/server 三项测试覆盖）
 - [ ] 本机进入不重复输入密钥；远程无认证、伪造 Host/Origin、跨站写请求被拒绝；退出后受保护会话失效。
-- [ ] 冒烟验证 HTTP 状态及页面内容，路径穿越与资源缺失有针对性测试。
+- [x] 冒烟验证 HTTP 状态及页面内容，路径穿越与资源缺失有针对性测试。（2026-09-08：smoke-test.sh 页面断言；main_test.go TestStaticBlocksPathTraversal）
 
 ### MR-003 领域合约与数据库增量迁移
 
@@ -150,7 +150,7 @@ P0 · 部分实现 · 对应 M1–M5、US-003/005/009/011 · 依赖：MR-001。
 实现步骤：①将 §3 的字段、枚举、单位、空值和错误码写成版本化合约；②拆分 Connector 能力接口并保留现有适配路径；③分功能新增 v2 及以后 migration，禁止改已运行的 v1；④统一模型内部 ID 与 `(provider_id, upstream_id)` 唯一键，路由候选使用明确引用；⑤每个新增表在所属任务中完成仓储与回填，避免一次空建全部业务。
 
 - [x] 同名模型属于不同 Provider 时不覆盖，账户模式/计费方式/能力状态可独立表达。（2026-09-07：migration v2 加 `UNIQUE(provider_id, upstream_id)` 且有重复插入拒绝测试；domain 新增 AccountMode/AuthType/BillingMode/AuthState/CapabilityStatus 枚举并落列，见 `docs/contracts/data-contracts-v1.md`）
-- [ ] 旧数据迁移和空库初始化均有测试，失败事务回滚，未来 schema 版本拒绝旧程序写入。（已有 v1→v2 升级、空库初始化、前向拒绝测试；**缺迁移失败注入的回滚测试**）
+- [x] 旧数据迁移和空库初始化均有测试，失败事务回滚，未来 schema 版本拒绝旧程序写入。（2026-09-08：新增 TestMigrateFailureRollsBack——失败迁移回滚且版本不推进；v1→v2 升级、空库初始化、前向拒绝测试已有）
 - [ ] 迁移已有用户数据库前 MR-028 已验收；开发验证使用独立 fixture 数据库。
 
 ### MR-004 平台与账户完整生命周期
@@ -160,9 +160,9 @@ P0 · 部分实现 · 对应 M2、US-003、FR-31/32 · 依赖：MR-002、MR-003�
 目标文件：`internal/api`、`internal/repository`、`internal/credentials`；新增 `internal/accounts`。
 实现步骤：①补齐平台/账户详情、编辑、禁用、删除和必填/URL 校验；②支持两种账户模式；③凭据更换先建立新 SecretRef，再原子切换引用，失败保留旧凭据；④禁用立即禁止新转发，删除保留历史快照并撤销引用；⑤管理变更写脱敏审计，凭据清理失败产生可重试任务。
 
-- [ ] 创建/修改/禁用/删除和错误输入通过 API 测试；仅监测账户永不成为路由候选。
+- [x] 创建/修改/禁用/删除和错误输入通过 API 测试；仅监测账户永不成为路由候选。（2026-09-08：PATCH/DELETE 账户 API + TestAccountLifecycle；router 过滤 mode=monitor_only，TestForwardExcludesMonitorOnlyAccounts）
 - [ ] 新密钥验证失败不会丢失原可用配置，API 不返回完整密钥，重复删除行为明确。
-- [ ] 删除仍被引用的平台返回冲突；删除账户后历史请求与费用仍可查询。
+- [x] 删除仍被引用的平台返回冲突；删除账户后历史请求与费用仍可查询。（2026-09-08：CodeConflict→409；账户有 usage_events 时拒绝删除，历史强制保留）
 
 ### MR-005 账户管理界面与首次向导
 

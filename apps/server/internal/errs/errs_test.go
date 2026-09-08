@@ -9,6 +9,7 @@ import (
 func TestCodeHTTPStatus(t *testing.T) {
 	cases := map[Code]int{
 		CodeInvalidRequest:   http.StatusBadRequest,
+		CodeConflict:         http.StatusConflict,
 		CodeUnauthorized:     http.StatusUnauthorized,
 		CodeForbidden:        http.StatusForbidden,
 		CodeNotFound:         http.StatusNotFound,

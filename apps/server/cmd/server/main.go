@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -76,6 +78,17 @@ func run() error {
 	guard := session.NewGuard(cfg.LocalOnly, cfg.AdminKey)
 	srv := httpserver.New(log, httpserver.NewDBStore(version), guard)
 	app.Mount(srv)
+
+	// 管理页静态托管（M1/MR-002）：配置 StaticDir 时提供 SPA fallback；
+	// 未知 /api、/v1 路径返回 JSON 404，不回退 HTML。
+	if cfg.StaticDir != "" {
+		if st, err := os.Stat(cfg.StaticDir); err == nil && st.IsDir() {
+			srv.MountFunc("/", staticHandler(cfg.StaticDir))
+			log.Info("static panel mounted", "dir", cfg.StaticDir)
+		} else {
+			log.Warn("static dir missing, panel disabled", "dir", cfg.StaticDir)
+		}
+	}
 	handler := srv.Handler()
 	server := &http.Server{
 		Handler:           handler,
@@ -131,4 +144,30 @@ func newLogger(level string) *slog.Logger {
 
 func version() string {
 	return "0.1.0-dev"
+}
+
+// staticHandler 托管管理前端：文件存在则直接返回；否则 SPA 回退 index.html。
+// /api、/v1 前缀与 /healthz、/readyz 不回退 HTML（未知 API 返回 JSON 404）。
+func staticHandler(dir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if p != "/" && (strings.HasPrefix(p, "/api/") || strings.HasPrefix(p, "/v1/")) {
+			httpserver.WriteJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{
+				"code": "not_found", "message": "接口不存在",
+			}})
+			return
+		}
+		// 防路径穿越：Clean 后必须仍在 StaticDir 内
+		clean := filepath.Clean("/" + p)
+		full := filepath.Join(dir, clean)
+		if !strings.HasPrefix(full, filepath.Clean(dir)+string(os.PathSeparator)) && full != filepath.Clean(dir) {
+			http.NotFound(w, r)
+			return
+		}
+		if info, err := os.Stat(full); err == nil && !info.IsDir() {
+			http.ServeFile(w, r, full)
+			return
+		}
+		http.ServeFile(w, r, filepath.Join(dir, "index.html"))
+	}
 }

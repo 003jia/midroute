@@ -5,6 +5,7 @@ package api
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -40,9 +41,12 @@ func NewApp(store *repository.Store, v credentials.Vault, r *router.Router, log 
 func (a *App) Mount(srv *httpserver.Server) {
 	// 管理 API
 	srv.MountFunc("/api/v1/providers", a.handleProviders)
+	srv.MountFunc("/api/v1/providers/", a.providerAction)
 	srv.MountFunc("/api/v1/accounts", a.handleAccounts)
 	srv.MountFunc("/api/v1/accounts/", a.accountAction)
 	srv.MountFunc("/api/v1/models", a.handleModels)
+	srv.MountFunc("/api/v1/tokens", a.handleTokens)
+	srv.MountFunc("/api/v1/tokens/", a.tokenAction)
 	srv.MountFunc("/api/v1/routing-policies", a.handleRoutingPolicies)
 	srv.MountFunc("/api/v1/routing-policies/", a.handleRoutingPolicyByAlias)
 	// OpenAI-compatible 网关
@@ -204,16 +208,99 @@ func (a *App) createAccount(w http.ResponseWriter, r *http.Request) {
 	httpserver.WriteJSON(w, http.StatusCreated, map[string]any{"id": accountID, "secret_fingerprint": ref.Fingerprint})
 }
 
-// accountAction 处理 /api/v1/accounts/:id/{verify|discover}
+// accountAction 处理 /api/v1/accounts/{id}/{action} 与 /api/v1/accounts/{id}（PATCH/DELETE，MR-004）。
 func (a *App) accountAction(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	// [api v1 accounts <id> <action>]
-	if len(parts) != 5 {
+	switch {
+	case len(parts) == 4:
+		// [api v1 accounts <id>]
+		switch r.Method {
+		case http.MethodPatch, http.MethodPut:
+			a.updateAccount(w, r, parts[3])
+		case http.MethodDelete:
+			a.deleteAccount(w, r, parts[3])
+		default:
+			httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
+		}
+	case len(parts) == 5:
+		// [api v1 accounts <id> <action>]
+		a.accountSubAction(w, r, parts[3], parts[4])
+	default:
 		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "路径无效"))
+	}
+}
+
+// updateAccount 更新账户（编辑名称/启停；MR-004）。
+func (a *App) updateAccount(w http.ResponseWriter, r *http.Request, accountID string) {
+	var in struct {
+		Name   *string `json:"name,omitempty"`
+		Status *string `json:"status,omitempty"` // active | disabled | error
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "请求体无效"))
 		return
 	}
-	accountID := parts[3]
-	action := parts[4]
+	acc, err := a.Store.GetAccount(r.Context(), accountID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			httpserver.WriteError(w, errs.New(errs.CodeNotFound, "账户不存在"))
+			return
+		}
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询账户失败", err))
+		return
+	}
+	if in.Status != nil {
+		switch *in.Status {
+		case "active", "disabled", "error":
+		default:
+			httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "非法状态: "+*in.Status))
+			return
+		}
+		if err := a.Store.SetAccountStatus(r.Context(), accountID, *in.Status); err != nil {
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "更新状态失败", err))
+			return
+		}
+		_ = a.Store.RecordAuditEvent(r.Context(), "admin", "account.status", accountID, *in.Status)
+	}
+	if in.Name != nil && *in.Name != "" && *in.Name != acc.Name {
+		if err := a.Store.SetAccountName(r.Context(), accountID, *in.Name); err != nil {
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "更新名称失败", err))
+			return
+		}
+		_ = a.Store.RecordAuditEvent(r.Context(), "admin", "account.rename", accountID, "")
+	}
+	updated, _ := a.Store.GetAccount(r.Context(), accountID)
+	httpserver.WriteJSON(w, http.StatusOK, updated)
+}
+
+// deleteAccount 删除账户：被路由策略或历史用量引用时返回冲突（MR-004）。
+func (a *App) deleteAccount(w http.ResponseWriter, r *http.Request, accountID string) {
+	if _, err := a.Store.GetAccount(r.Context(), accountID); err != nil {
+		if err == sql.ErrNoRows {
+			httpserver.WriteError(w, errs.New(errs.CodeNotFound, "账户不存在"))
+			return
+		}
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询账户失败", err))
+		return
+	}
+	if n, _ := a.Store.CountRoutingCandidatesByAccount(r.Context(), accountID); n > 0 {
+		httpserver.WriteError(w, errs.New(errs.CodeConflict, "账户仍被路由策略引用，请先移除候选"))
+		return
+	}
+	if n, _ := a.Store.CountUsageEventsByAccount(r.Context(), accountID); n > 0 {
+		httpserver.WriteError(w, errs.New(errs.CodeConflict, "账户存在历史用量记录，仅可禁用不可删除"))
+		return
+	}
+	if err := a.Store.DeleteAccount(r.Context(), accountID); err != nil {
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "删除账户失败", err))
+		return
+	}
+	_ = a.Store.RecordAuditEvent(r.Context(), "admin", "account.delete", accountID, "")
+	httpserver.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// accountSubAction 处理账户子动作。
+func (a *App) accountSubAction(w http.ResponseWriter, r *http.Request, accountID, action string) {
 	acc, err := a.Store.GetAccount(r.Context(), accountID)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -263,6 +350,147 @@ func (a *App) accountAction(w http.ResponseWriter, r *http.Request) {
 		httpserver.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "count": len(infos)})
 	default:
 		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "不支持的动作: "+action))
+	}
+}
+
+// -------- providers 生命周期（MR-004）--------
+
+func (a *App) providerAction(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	// [api v1 providers <id>]
+	if len(parts) != 4 {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "路径无效"))
+		return
+	}
+	id := parts[3]
+	switch r.Method {
+	case http.MethodPatch, http.MethodPut:
+		var in struct {
+			Name    *string `json:"name,omitempty"`
+			BaseURL *string `json:"base_url,omitempty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+			httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "请求体无效"))
+			return
+		}
+		if err := a.Store.UpdateProvider(r.Context(), id, in.Name, in.BaseURL); err != nil {
+			if err == sql.ErrNoRows {
+				httpserver.WriteError(w, errs.New(errs.CodeNotFound, "Provider 不存在"))
+				return
+			}
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "更新 Provider 失败", err))
+			return
+		}
+		_ = a.Store.RecordAuditEvent(r.Context(), "admin", "provider.update", id, "")
+		p, _ := a.Store.GetProvider(r.Context(), id)
+		httpserver.WriteJSON(w, http.StatusOK, p)
+	case http.MethodDelete:
+		if n, _ := a.Store.CountAccountsByProvider(r.Context(), id); n > 0 {
+			httpserver.WriteError(w, errs.New(errs.CodeConflict, "Provider 仍有账户引用，请先删除或迁移账户"))
+			return
+		}
+		if err := a.Store.DeleteProvider(r.Context(), id); err != nil {
+			if err == sql.ErrNoRows {
+				httpserver.WriteError(w, errs.New(errs.CodeNotFound, "Provider 不存在"))
+				return
+			}
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "删除 Provider 失败", err))
+			return
+		}
+		_ = a.Store.RecordAuditEvent(r.Context(), "admin", "provider.delete", id, "")
+		httpserver.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	default:
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
+	}
+}
+
+// -------- tokens（MR-016 / PRD M2 Token 数据模型）--------
+
+func (a *App) handleTokens(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		list, err := a.Store.ListTokens(r.Context())
+		if err != nil {
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询令牌失败", err))
+			return
+		}
+		httpserver.WriteJSON(w, http.StatusOK, map[string]any{"data": list})
+	case http.MethodPost:
+		a.createToken(w, r)
+	default:
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
+	}
+}
+
+func (a *App) createToken(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || strings.TrimSpace(in.Name) == "" {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "缺少 name"))
+		return
+	}
+	// 生成明文令牌（仅此一次返回）；库中只存 SHA-256 与前缀
+	raw := "mrt_" + randHex(24)
+	sum := sha256.Sum256([]byte(raw))
+	t := domain.Token{
+		ID:        "tok_" + randHex(4),
+		Name:      strings.TrimSpace(in.Name),
+		KeyHash:   fmt.Sprintf("%x", sum),
+		KeyPrefix: raw[:10],
+		Enabled:   true,
+		CreatedAt: a.now(),
+	}
+	if err := a.Store.CreateToken(r.Context(), t); err != nil {
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "创建令牌失败", err))
+		return
+	}
+	_ = a.Store.RecordAuditEvent(r.Context(), "admin", "token.create", t.ID, "")
+	httpserver.WriteJSON(w, http.StatusCreated, map[string]any{
+		"id": t.ID, "name": t.Name, "key_prefix": t.KeyPrefix, "token": raw,
+		"note": "令牌明文仅此一次显示，请妥善保存",
+	})
+}
+
+func (a *App) tokenAction(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) != 4 {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "路径无效"))
+		return
+	}
+	id := parts[3]
+	switch r.Method {
+	case http.MethodPatch, http.MethodPut:
+		var in struct {
+			Enabled *bool `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Enabled == nil {
+			httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "缺少 enabled"))
+			return
+		}
+		if err := a.Store.SetTokenEnabled(r.Context(), id, *in.Enabled); err != nil {
+			if err == sql.ErrNoRows {
+				httpserver.WriteError(w, errs.New(errs.CodeNotFound, "令牌不存在"))
+				return
+			}
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "更新令牌失败", err))
+			return
+		}
+		_ = a.Store.RecordAuditEvent(r.Context(), "admin", "token.status", id, fmt.Sprintf("%v", *in.Enabled))
+		httpserver.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	case http.MethodDelete:
+		if err := a.Store.DeleteToken(r.Context(), id); err != nil {
+			if err == sql.ErrNoRows {
+				httpserver.WriteError(w, errs.New(errs.CodeNotFound, "令牌不存在"))
+				return
+			}
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "删除令牌失败", err))
+			return
+		}
+		_ = a.Store.RecordAuditEvent(r.Context(), "admin", "token.delete", id, "")
+		httpserver.WriteJSON(w, http.StatusOK, map[string]any{"ok": true})
+	default:
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
 	}
 }
 
@@ -381,11 +609,11 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	latency := time.Since(start).Milliseconds()
 	if err != nil {
 		a.logError(decision, err)
-		a.recordUsage(r, requestID, req.Model, decision, nil, latency, errs.From(err).Code)
+		a.recordUsage(requestID, req.Model, decision, nil, latency, errs.From(err).Code)
 		httpserver.WriteError(w, a.mapRelayError(err))
 		return
 	}
-	a.recordUsage(r, requestID, req.Model, decision, resp.Usage, latency, "")
+	a.recordUsage(requestID, req.Model, decision, resp.Usage, latency, "")
 	if resp.ID == "" {
 		resp.ID = "chatcmpl-" + requestID
 	}
@@ -394,7 +622,8 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 // recordUsage 记录请求用量元数据（不保存正文；FR-12/FR-13）。
-func (a *App) recordUsage(r *http.Request, requestID, model string, decision *router.Decision, usage *connectors.UsageDTO, latencyMS int64, errCode errs.Code) {
+// 使用独立 context：客户端取消不应丢失用量记录；写库失败必须记日志（FR-47）。
+func (a *App) recordUsage(requestID, model string, decision *router.Decision, usage *connectors.UsageDTO, latencyMS int64, errCode errs.Code) {
 	ev := repository.UsageEvent{
 		ID:         "ue_" + shortID(),
 		RequestID:  requestID,
@@ -418,7 +647,13 @@ func (a *App) recordUsage(r *http.Request, requestID, model string, decision *ro
 			ev.AccountID = decision.Selected[:i]
 		}
 	}
-	_ = a.Store.RecordUsageEvent(r.Context(), ev)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := a.Store.RecordUsageEvent(ctx, ev); err != nil {
+		if a.Log != nil {
+			a.Log.Error("usage event write failed", "request_id", requestID, "err", err)
+		}
+	}
 }
 
 func (a *App) streamChat(w http.ResponseWriter, r *http.Request, req *connectors.ChatRequest, requestID string) {
@@ -442,10 +677,14 @@ func (a *App) streamChat(w http.ResponseWriter, r *http.Request, req *connectors
 	})
 	latency := time.Since(start).Milliseconds()
 	if err != nil && !started {
-		// 尚未输出任何内容，可回写错误事件
-		_ = usage
-		a.recordUsage(r, requestID, req.Model, decision, nil, latency, errs.From(err).Code)
-		w.Write([]byte("data: {\"error\":{\"code\":\"upstream_error\",\"message\":\"" + err.Error() + "\"}}\n\n"))
+		// 尚未输出任何内容，回写稳定错误事件（不透传上游原文，防泄露）
+		a.logError(decision, err)
+		stable := a.mapRelayError(err)
+		a.recordUsage(requestID, req.Model, decision, nil, latency, stable.Code)
+		payload, _ := json.Marshal(map[string]any{"error": map[string]any{
+			"code": stable.Code, "message": stable.Message, "request_id": requestID,
+		}})
+		w.Write([]byte("data: " + string(payload) + "\n\n"))
 		flusher.Flush()
 		return
 	}
@@ -458,7 +697,11 @@ func (a *App) streamChat(w http.ResponseWriter, r *http.Request, req *connectors
 			PromptTokens: usage.InputTokens, CompletionTokens: usage.OutputTokens, TotalTokens: usage.InputTokens + usage.OutputTokens,
 		}
 	}
-	a.recordUsage(r, requestID, req.Model, decision, usageDTO, latency, "")
+	errCode := errs.Code("")
+	if err != nil {
+		errCode = a.mapRelayError(err).Code
+	}
+	a.recordUsage(requestID, req.Model, decision, usageDTO, latency, errCode)
 	w.Write([]byte("data: [DONE]\n\n"))
 	flusher.Flush()
 }
@@ -520,7 +763,12 @@ func provModelID(providerID, upstreamID string) string {
 
 // shortID 生成随机短 ID。
 func shortID() string {
-	b := make([]byte, 6)
+	return randHex(6)
+}
+
+// randHex 生成 n 字节随机数的十六进制串。
+func randHex(n int) string {
+	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}

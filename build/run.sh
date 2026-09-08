@@ -19,4 +19,4 @@ echo "   模式:       本地（仅 loopback）"
 echo "   远程访问需设置 MIDROUTE_ADMIN_KEY 并关闭本地限制"
 echo "======================================================"
 
-exec env MIDROUTE_DATA_DIR="$DATA" MIDROUTE_HTTP_ADDR="$PORT" "$BIN"
+exec env MIDROUTE_DATA_DIR="$DATA" MIDROUTE_HTTP_ADDR="$PORT" MIDROUTE_STATIC_DIR="$ROOT/dist/web" "$BIN"

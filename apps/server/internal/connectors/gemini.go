@@ -274,6 +274,7 @@ func newGeminiStreamTranslator(model string, onChunk func([]byte) error) *gemini
 }
 
 func (t *geminiStreamTranslator) translate(ctx context.Context, resp *http.Response) (*Usage, error) {
+	done := false
 	err := consumeSSE(ctx, resp, func(raw []byte) error {
 		block := string(raw)
 		payload, ok := extractData(block)
@@ -286,6 +287,9 @@ func (t *geminiStreamTranslator) translate(ctx context.Context, resp *http.Respo
 		var ev geminiResponse
 		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
 			return nil
+		}
+		if len(ev.Candidates) > 0 && ev.Candidates[0].FinishReason != "" {
+			done = true
 		}
 		text := ""
 		if len(ev.Candidates) > 0 {
@@ -309,6 +313,9 @@ func (t *geminiStreamTranslator) translate(ctx context.Context, resp *http.Respo
 	})
 	if t.usage == nil {
 		t.usage = &Usage{}
+	}
+	if !done {
+		return t.usage, fmt.Errorf("upstream stream truncated")
 	}
 	return t.usage, err
 }

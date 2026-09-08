@@ -99,14 +99,31 @@ func (c *OpenAICompatibleConnector) ForwardStream(ctx context.Context, t Target,
 	if err != nil {
 		return nil, err
 	}
+	done := false
 	usage := &Usage{}
 	err = consumeSSE(ctx, resp, func(b []byte) error {
+		if bytesIndex(b, []byte("[DONE]")) >= 0 {
+			done = true
+		}
 		return onChunk(b)
 	})
 	if err != nil {
 		return usage, classifyUpstreamError(0, nil)
 	}
+	if !done {
+		return usage, fmt.Errorf("upstream stream truncated")
+	}
 	return usage, nil
+}
+
+// bytesIndex 在 b 中查找子序列 sub 的位置；未找到返回 -1。
+func bytesIndex(b, sub []byte) int {
+	for i := 0; i+len(sub) <= len(b); i++ {
+		if string(b[i:i+len(sub)]) == string(sub) {
+			return i
+		}
+	}
+	return -1
 }
 
 func (c *OpenAICompatibleConnector) ProbeHealth(ctx context.Context, t Target) (*HealthProbe, error) {

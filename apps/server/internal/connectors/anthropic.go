@@ -333,5 +333,8 @@ func (t *anthropicStreamTranslator) translate(ctx context.Context, resp *http.Re
 	if t.usage == nil {
 		t.usage = &Usage{}
 	}
+	if !t.finished {
+		return t.usage, fmt.Errorf("upstream stream truncated")
+	}
 	return t.usage, err
 }
