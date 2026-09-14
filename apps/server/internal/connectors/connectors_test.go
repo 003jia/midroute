@@ -3,6 +3,7 @@ package connectors
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -229,5 +230,34 @@ func TestGeminiStreamTranslation(t *testing.T) {
 	}
 	if usage.InputTokens != 5 || usage.OutputTokens != 3 {
 		t.Fatalf("usage=%+v", usage)
+	}
+}
+
+// 结构化错误分类（MR-012/ISS-09）：errors.Is 判定，不靠字符串。
+func TestStructuredErrorClassification(t *testing.T) {
+	if !errors.Is(Classify(429, nil), ErrRateLimited) {
+		t.Fatal("429 must be ErrRateLimited")
+	}
+	if !errors.Is(Classify(401, nil), ErrAuth) {
+		t.Fatal("401 must be ErrAuth")
+	}
+	if !errors.Is(Classify(503, nil), ErrUpstream) {
+		t.Fatal("503 must be ErrUpstream")
+	}
+	if !errors.Is(Classify(404, nil), ErrModelUnavailable) {
+		t.Fatal("404 must be ErrModelUnavailable")
+	}
+	if !errors.Is(Classify(0, context.DeadlineExceeded), ErrTimeout) {
+		t.Fatal("deadline must be ErrTimeout")
+	}
+	if !Retryable(Classify(429, nil)) || !Retryable(Classify(0, context.DeadlineExceeded)) || !Retryable(ErrTruncated) {
+		t.Fatal("retryable classification wrong")
+	}
+	if Retryable(Classify(401, nil)) || Retryable(Classify(404, nil)) {
+		t.Fatal("auth/not-found must not be retryable")
+	}
+	var ue *UpstreamError
+	if !errors.As(Classify(500, nil), &ue) {
+		t.Fatal("expected *UpstreamError")
 	}
 }

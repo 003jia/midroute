@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
-	"strings"
 	"time"
 
 	"midroute/internal/connectors"
@@ -213,20 +212,11 @@ func (r *Router) ForwardStream(ctx context.Context, alias string, req *connector
 	return nil, decision, lastErr
 }
 
-// safeToRetry 仅在可安全重试的错误上切换（429、部分 5xx、网络/超时）。
+// safeToRetry 仅在可安全重试的错误上切换（429、超时、网络、截断、5xx）。
+// 使用结构化错误分类（errors.Is），禁止字符串匹配（MR-012）。
 func safeToRetry(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
-	if strings.Contains(msg, "rate_limited") || strings.Contains(msg, "429") {
-		return true
-	}
-	if strings.Contains(msg, "timeout") || strings.Contains(msg, "5xx") || strings.Contains(msg, "truncated") {
-		return true
-	}
-	if strings.Contains(msg, "connection") || strings.Contains(msg, "TLS") || strings.Contains(msg, "EOF") {
-		return true
-	}
-	return false
+	return connectors.Retryable(err)
 }

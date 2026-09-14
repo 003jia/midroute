@@ -7,7 +7,7 @@
 
 | 编号 | 严重度 | 关联任务 | 一句话描述 | 状态 |
 |---|---|---|---|---|
-| ISS-01 | P0 | MR-002 | 管理页 404 未修复：StaticDir 是死配置，httpserver 无任何静态托管 | **已修复（2026-09-08，a8ae51a：main.go 挂载 StaticDir + SPA 回落 + JSON 404 + 路径穿越测试）** |
+| ISS-01 | P0 | MR-002 | 管理页 404 **已修复（2026-09-14）**：StaticDir 是死配置，httpserver 无任何静态托管 | **已修复（2026-09-08，a8ae51a：main.go 挂载 StaticDir + SPA 回落 + JSON 404 + 路径穿越测试）** |
 | ISS-02 | P0 | MR-012 | router `streamed` 标志从未置 true，首块输出后防重放防护实际失效 | **已修复（2026-09-08，a8ae51a：onChunk 置位 + 相关测试）** |
 | ISS-03 | P0 | MR-015 | 用量落库复用请求 context 且忽略错误：客户端取消即丢记录；流式中断被记为成功 | **已修复（2026-09-08，a8ae51a：终态写入改独立 context.WithTimeout(3s)）** |
 | ISS-04 | P0 | MR-028 | 备份脚本不覆盖现行主库 `midroute.db`，且显式打包明文凭据 `local.keys` | **已修复（2026-09-14：midroute.db 在线备份、默认排除 local.keys/data.key（--include-secrets 显式携带）、manifest 含 app/schema 版本与 SHA-256；恢复入口仍属 MR-028 后续）** |
@@ -15,7 +15,7 @@
 | ISS-06 | P0 | MR-030 | secret-scan 命中时打印整行内容（含疑似密钥本身），不满足"只报告脱敏位置" | **已修复（2026-09-14：sed 截断为 文件:行号+提示， planted-key 自测通过）** |
 | ISS-07 | P0 | MR-002 | 无会话机制、无 Host/Origin 校验、无 CSRF 防护：localOnly 下浏览器跨站可直写管理 API | **已修复（2026-09-14：免登录路径 loopback 字面量 Host 强制 + 写请求同源校验 + 会话 Cookie（HttpOnly/SameSite=Strict、滑动续期、退出失效））** |
 | ISS-08 | P1 | MR-001 | 冒烟脚本固定端口 18100、固定数据路径 `/tmp/midroute-smoke` 且启动即 `rm -rf`，可误伤已有实例 | **已修复（2026-09-14：mktemp 唯一数据目录 + 随机空闲端口 + 进程存活校验 + trap 精确清理）** |
-| ISS-09 | P1 | MR-012 | 上游错误分类靠字符串匹配（`safeToRetry`/`mapRelayError`），无结构化错误类型 | 未修复 |
+| ISS-09 | P1 | MR-012 | 上游错误分类靠字符串匹配（`safeToRetry`/`mapRelayError`），无结构化错误类型 | **已修复（2026-09-14：connectors 结构化 UpstreamError + ErrRateLimited/ErrAuth/ErrTimeout/ErrNetwork/ErrTruncated/ErrModelUnavailable/ErrUpstream；router/api/accounts 全部改用 errors.Is/As，新增 TestStructuredErrorClassification）** |
 | ISS-10 | P1 | MR-012 | OpenAI 兼容连接器流式 usage 恒为空、流式出错丢弃真实错误改抛笼统错误 | 未修复 |
 | ISS-11 | P1 | MR-015/019 | `reasoning_tokens` 列从不填充；流式路径 cache/reasoning 丢失；cache 读写价被合并 | 未修复 |
 | ISS-12 | P1 | MR-003 | `models` 表无 `(provider_id, upstream_id)` DB 级唯一约束；未来 schema 版本不拒绝旧程序写入 | **已修复（2026-09-07，migration v2 + 前向拒绝 + 测试）** |

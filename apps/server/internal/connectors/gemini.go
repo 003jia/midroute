@@ -227,8 +227,8 @@ func (c *GeminiConnector) forwardGemini(ctx context.Context, t Target, model str
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		raw, _ := readBytes(resp, 4096)
-		return nil, classifyUpstreamError(resp.StatusCode, raw)
+		_, _ = readBytes(resp, 4096)
+		return nil, Classify(resp.StatusCode, nil)
 	}
 	var out geminiResponse
 	if err := readJSON(&out, resp); err != nil {
@@ -315,7 +315,7 @@ func (t *geminiStreamTranslator) translate(ctx context.Context, resp *http.Respo
 		t.usage = &Usage{}
 	}
 	if !done {
-		return t.usage, fmt.Errorf("upstream stream truncated")
+		return t.usage, ErrTruncated
 	}
 	return t.usage, err
 }

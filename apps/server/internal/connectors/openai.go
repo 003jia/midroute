@@ -80,8 +80,8 @@ func (c *OpenAICompatibleConnector) Forward(ctx context.Context, t Target, req *
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		raw, _ := readBytes(resp, 4096)
-		return nil, classifyUpstreamError(resp.StatusCode, raw)
+		_, _ = readBytes(resp, 4096)
+		return nil, Classify(resp.StatusCode, nil)
 	}
 	var out ChatResponse
 	if err := readJSON(&out, resp); err != nil {
@@ -108,10 +108,10 @@ func (c *OpenAICompatibleConnector) ForwardStream(ctx context.Context, t Target,
 		return onChunk(b)
 	})
 	if err != nil {
-		return usage, classifyUpstreamError(0, nil)
+		return usage, Classify(0, err)
 	}
 	if !done {
-		return usage, fmt.Errorf("upstream stream truncated")
+		return usage, ErrTruncated
 	}
 	return usage, nil
 }
@@ -134,18 +134,4 @@ func (c *OpenAICompatibleConnector) ProbeHealth(ctx context.Context, t Target) (
 		return &HealthProbe{OK: false, LatencyMS: lat, Error: err.Error()}, nil
 	}
 	return &HealthProbe{OK: true, LatencyMS: lat}, nil
-}
-
-// classifyUpstreamError 将上游错误归类为可重试/稳定语义（429、5xx、其他）。
-func classifyUpstreamError(status int, body []byte) error {
-	switch {
-	case status == http.StatusTooManyRequests:
-		return fmt.Errorf("upstream rate_limited")
-	case status >= 500 && status <= 599:
-		return fmt.Errorf("upstream 5xx")
-	case status == http.StatusUnauthorized || status == http.StatusForbidden:
-		return fmt.Errorf("upstream auth")
-	default:
-		return fmt.Errorf("upstream error http_%d", status)
-	}
 }

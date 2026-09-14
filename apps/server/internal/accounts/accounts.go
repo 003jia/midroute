@@ -5,8 +5,8 @@ package accounts
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"midroute/internal/connectors"
@@ -161,11 +161,11 @@ func (c *CapabilityChecker) Check(ctx context.Context, acc domain.Account) ([]do
 }
 
 func statusFromErr(err error) domain.CapabilityStatus {
-	msg := err.Error()
+	// 结构化错误分类（MR-012）
 	switch {
-	case strings.Contains(msg, "401"), strings.Contains(msg, "403"), strings.Contains(msg, "权限"):
+	case errors.Is(err, connectors.ErrAuth):
 		return domain.CapabilityPermissionRequired
-	case strings.Contains(msg, "429"), strings.Contains(msg, "rate"):
+	case errors.Is(err, connectors.ErrRateLimited):
 		return domain.CapabilityUnknown
 	default:
 		return domain.CapabilityError

@@ -1121,16 +1121,27 @@ func (a *App) streamChat(w http.ResponseWriter, r *http.Request, req *connectors
 
 // mapRelayError 将中继错误映射为稳定错误。
 func (a *App) mapRelayError(err error) *errs.Error {
-	msg := err.Error()
-	switch {
-	case strings.Contains(msg, "no usable candidate"):
+	// 结构化错误分类（MR-012）：errors.Is/As，禁止字符串匹配
+	if errors.Is(err, router.ErrNoCandidate) {
 		return errs.New(errs.CodeModelUnavailable, "没有可用渠道")
-	case strings.Contains(msg, "upstream auth"):
+	}
+	switch {
+	case errors.Is(err, connectors.ErrAuth):
 		return errs.New(errs.CodeUpstreamAuth, "上游鉴权失败")
-	case strings.Contains(msg, "upstream rate_limited"), strings.Contains(msg, "429"):
+	case errors.Is(err, connectors.ErrRateLimited):
 		return errs.Retryable(errs.New(errs.CodeRateLimited, "上游限流"))
-	case strings.Contains(msg, "upstream 5xx"), strings.Contains(msg, "timeout"):
+	case errors.Is(err, connectors.ErrTimeout):
+		return errs.Retryable(errs.New(errs.CodeUpstreamTimeout, "上游超时"))
+	case errors.Is(err, connectors.ErrNetwork):
+		return errs.Retryable(errs.New(errs.CodeUpstreamError, "网络错误"))
+	case errors.Is(err, connectors.ErrTruncated):
+		return errs.Retryable(errs.New(errs.CodeUpstreamError, "流式响应被截断"))
+	case errors.Is(err, connectors.ErrModelUnavailable):
+		return errs.New(errs.CodeModelUnavailable, "上游模型不可用")
+	case errors.Is(err, connectors.ErrUpstream):
 		return errs.Retryable(errs.New(errs.CodeUpstreamError, "上游异常"))
+	case errors.Is(err, connectors.ErrQuotaExhausted):
+		return errs.New(errs.CodeQuotaExhausted, "上游额度耗尽")
 	default:
 		return errs.Wrap(errs.CodeUpstreamError, "转发失败", err)
 	}

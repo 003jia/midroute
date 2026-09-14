@@ -5,6 +5,10 @@ package connectors
 import (
 	"context"
 	"errors"
+	"io"
+	"net"
+	"net/http"
+	"syscall"
 )
 
 // ProviderKind 平台类型。
@@ -82,6 +86,110 @@ var ErrUnsupported = errors.New("connectors: capability unsupported")
 
 // ErrQuotaExhausted 上游返回额度耗尽（429 + 特定头或体）。
 var ErrQuotaExhausted = errors.New("connectors: quota exhausted")
+
+// 结构化上游错误分类（MR-012）：重试/路由判定一律用 errors.Is/As，
+// 禁止用 err.Error() 字符串片段猜测分类。
+var (
+	// ErrRateLimited 上游限流（429）。
+	ErrRateLimited = errors.New("connectors: upstream rate limited")
+	// ErrAuth 上游鉴权失败（401/403）。
+	ErrAuth = errors.New("connectors: upstream authentication failed")
+	// ErrTimeout 上游超时。
+	ErrTimeout = errors.New("connectors: upstream timeout")
+	// ErrNetwork 网络/连接层错误。
+	ErrNetwork = errors.New("connectors: network error")
+	// ErrUpstream 上游 5xx 等一般服务错误。
+	ErrUpstream = errors.New("connectors: upstream server error")
+	// ErrTruncated 流式响应被截断（未收到合法结束标记）。
+	ErrTruncated = errors.New("connectors: upstream stream truncated")
+	// ErrModelUnavailable 上游模型不存在/不可用。
+	ErrModelUnavailable = errors.New("connectors: upstream model unavailable")
+)
+
+// UpstreamError 携带分类的上下游错误，支持 errors.Is/As。
+type UpstreamError struct {
+	Kind   error
+	Status int // 上游 HTTP 状态；0=无
+	Body   string
+	Err    error
+}
+
+func (e *UpstreamError) Error() string {
+	msg := e.Kind.Error()
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	if e.Body != "" {
+		msg += " (" + e.Body + ")"
+	}
+	return msg
+}
+
+func (e *UpstreamError) Unwrap() error { return e.Kind }
+
+// Is 让 *UpstreamError 可被 errors.Is(err, ErrRateLimited) 命中。
+func (e *UpstreamError) Is(target error) bool {
+	return e.Kind == target
+}
+
+// Retryable 判断该错误是否可安全重试（429/超时/网络/截断/5xx）。
+func Retryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch {
+	case errors.Is(err, ErrRateLimited):
+		return true
+	case errors.Is(err, ErrTimeout):
+		return true
+	case errors.Is(err, ErrNetwork):
+		return true
+	case errors.Is(err, ErrTruncated):
+		return true
+	case errors.Is(err, ErrUpstream):
+		return true // 5xx 类
+	default:
+		return false
+	}
+}
+
+// Classify 把 HTTP 状态与底层错误归类为结构化错误。
+func Classify(status int, err error) error {
+	switch {
+	case err != nil && errors.Is(err, context.DeadlineExceeded):
+		return &UpstreamError{Kind: ErrTimeout, Status: status, Err: err}
+	case err != nil && isNetErr(err):
+		return &UpstreamError{Kind: ErrNetwork, Status: status, Err: err}
+	case status == http.StatusTooManyRequests:
+		return &UpstreamError{Kind: ErrRateLimited, Status: status}
+	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+		return &UpstreamError{Kind: ErrAuth, Status: status}
+	case status == http.StatusNotFound:
+		return &UpstreamError{Kind: ErrModelUnavailable, Status: status}
+	case status >= 500 && status <= 599:
+		return &UpstreamError{Kind: ErrUpstream, Status: status}
+	default:
+		if err != nil {
+			return err
+		}
+		return &UpstreamError{Kind: ErrUpstream, Status: status}
+	}
+}
+
+func isNetErr(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) || errors.Is(err, io.EOF) || errors.Is(err, syscall.ECONNRESET)
+}
+
+// ClassifyWithBody 带上游响应体的分类（诊断信息随错误携带，不泄露凭据）。
+func ClassifyWithBody(status int, body []byte) error {
+	e, ok := Classify(status, nil).(*UpstreamError)
+	if !ok {
+		return Classify(status, nil)
+	}
+	e.Body = redactInline(string(body))
+	return e
+}
 
 // NewChatRequest 便捷构造。
 func NewChatRequest(model string, msgs []ChatMessage) *ChatRequest {

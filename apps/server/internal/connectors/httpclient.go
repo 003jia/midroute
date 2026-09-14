@@ -43,7 +43,7 @@ func readJSON[T any](out *T, resp *http.Response) error {
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("upstream HTTP %d: %s", resp.StatusCode, redactInline(string(raw)))
+		return ClassifyWithBody(resp.StatusCode, raw)
 	}
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 		return fmt.Errorf("decode upstream response: %w", err)
@@ -59,7 +59,7 @@ func readBytes(resp *http.Response, limit int64) ([]byte, error) {
 		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("upstream HTTP %d: %s", resp.StatusCode, redactInline(string(raw)))
+		return nil, ClassifyWithBody(resp.StatusCode, raw)
 	}
 	return raw, nil
 }
@@ -70,7 +70,7 @@ func consumeSSE(ctx context.Context, resp *http.Response, onChunk func([]byte) e
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("upstream HTTP %d: %s", resp.StatusCode, redactInline(string(raw)))
+		return ClassifyWithBody(resp.StatusCode, raw)
 	}
 	reader := bufio.NewReader(resp.Body)
 	var buf bytes.Buffer
