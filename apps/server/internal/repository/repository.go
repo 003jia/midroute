@@ -743,6 +743,133 @@ func (s *Store) MarkInterruptedRefreshJobs(ctx context.Context) (int, error) {
 	return int(n), nil
 }
 
+// -------- request_attempts（MR-015）--------
+
+// RequestAttempt 一次真实上游尝试。
+type RequestAttempt struct {
+	ID               string `json:"id"`
+	RequestID        string `json:"request_id"`
+	AttemptID        string `json:"attempt_id"`
+	AccountID        string `json:"account_id"`
+	ProviderID       string `json:"provider_id"`
+	LogicalModel     string `json:"logical_model"`
+	ActualModel      string `json:"actual_model"`
+	Protocol         string `json:"protocol"`
+	AccessTokenID    string `json:"access_token_id,omitempty"`
+	ProjectID        string `json:"project_id,omitempty"`
+	Status           string `json:"status"`
+	InputTokens      int64  `json:"input_tokens"`
+	OutputTokens     int64  `json:"output_tokens"`
+	CacheReadTokens  int64  `json:"cache_read_tokens"`
+	CacheWriteTokens int64  `json:"cache_write_tokens"`
+	ReasoningTokens  int64  `json:"reasoning_tokens"`
+	Metering         string `json:"metering"`
+	LatencyMS        int64  `json:"latency_ms"`
+	StatusCode       int    `json:"status_code"`
+	ErrorClass       string `json:"error_class,omitempty"`
+	ReasonCode       string `json:"reason_code,omitempty"`
+	PriceVersion     string `json:"price_version,omitempty"`
+	OccurredAt       string `json:"occurred_at"`
+	FinishedAt       string `json:"finished_at,omitempty"`
+}
+
+// CreateAttempt 记录一次尝试的开始（幂等：同 request+attempt 冲突时忽略）。
+func (s *Store) CreateAttempt(ctx context.Context, a RequestAttempt) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO request_attempts(id, request_id, attempt_id, account_id, provider_id, logical_model, actual_model,
+			protocol, access_token_id, project_id, status, occurred_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(request_id, attempt_id) DO NOTHING`,
+		a.ID, a.RequestID, a.AttemptID, a.AccountID, a.ProviderID, a.LogicalModel, a.ActualModel,
+		a.Protocol, a.AccessTokenID, a.ProjectID, "started", now())
+	return err
+}
+
+// FinishAttempt 幂等更新尝试终态（同一 request+attempt 重复提交不重复计费）。
+func (s *Store) FinishAttempt(ctx context.Context, a RequestAttempt) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE request_attempts SET
+			status=?, input_tokens=?, output_tokens=?, cache_read_tokens=?, cache_write_tokens=?,
+			reasoning_tokens=?, metering=?, latency_ms=?, status_code=?, error_class=?, reason_code=?,
+			actual_model=CASE WHEN ?<>'' THEN ? ELSE actual_model END, finished_at=?
+		WHERE request_id=? AND attempt_id=?`,
+		a.Status, a.InputTokens, a.OutputTokens, a.CacheReadTokens, a.CacheWriteTokens,
+		a.ReasoningTokens, a.Metering, a.LatencyMS, a.StatusCode, a.ErrorClass, a.ReasonCode,
+		a.ActualModel, a.ActualModel, now(), a.RequestID, a.AttemptID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// ListAttemptsByRequest 查询一个逻辑请求的全部尝试。
+func (s *Store) ListAttemptsByRequest(ctx context.Context, requestID string) ([]RequestAttempt, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, request_id, attempt_id, account_id, provider_id, logical_model, actual_model, protocol,
+			access_token_id, project_id, status, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+			reasoning_tokens, metering, latency_ms, status_code, error_class, reason_code, price_version, occurred_at, finished_at
+		FROM request_attempts WHERE request_id=? ORDER BY occurred_at, attempt_id`, requestID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []RequestAttempt{}
+	for rows.Next() {
+		var a RequestAttempt
+		if err := rows.Scan(&a.ID, &a.RequestID, &a.AttemptID, &a.AccountID, &a.ProviderID, &a.LogicalModel,
+			&a.ActualModel, &a.Protocol, &a.AccessTokenID, &a.ProjectID, &a.Status, &a.InputTokens, &a.OutputTokens,
+			&a.CacheReadTokens, &a.CacheWriteTokens, &a.ReasoningTokens, &a.Metering, &a.LatencyMS, &a.StatusCode,
+			&a.ErrorClass, &a.ReasonCode, &a.PriceVersion, &a.OccurredAt, &a.FinishedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// ListRecentAttempts 列出近期尝试（请求列表页）。
+func (s *Store) ListRecentAttempts(ctx context.Context, limit int) ([]RequestAttempt, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, request_id, attempt_id, account_id, provider_id, logical_model, actual_model, protocol,
+			access_token_id, project_id, status, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+			reasoning_tokens, metering, latency_ms, status_code, error_class, reason_code, price_version, occurred_at, finished_at
+		FROM request_attempts ORDER BY occurred_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []RequestAttempt{}
+	for rows.Next() {
+		var a RequestAttempt
+		if err := rows.Scan(&a.ID, &a.RequestID, &a.AttemptID, &a.AccountID, &a.ProviderID, &a.LogicalModel,
+			&a.ActualModel, &a.Protocol, &a.AccessTokenID, &a.ProjectID, &a.Status, &a.InputTokens, &a.OutputTokens,
+			&a.CacheReadTokens, &a.CacheWriteTokens, &a.ReasoningTokens, &a.Metering, &a.LatencyMS, &a.StatusCode,
+			&a.ErrorClass, &a.ReasonCode, &a.PriceVersion, &a.OccurredAt, &a.FinishedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// MarkStaleAttemptsInterrupted 重启时把遗留 started 尝试标为 interrupted（结果未知）。
+func (s *Store) MarkStaleAttemptsInterrupted(ctx context.Context) (int, error) {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE request_attempts SET status='interrupted', metering='unknown', finished_at=?
+		WHERE status='started'`, now())
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 // -------- access_tokens --------
 
 // tokenColumns 是令牌查询列清单（含 migration v4 作用域字段）。

@@ -178,6 +178,43 @@ CREATE TABLE refresh_jobs (
 );
 `,
 	},
+	{
+		Version: 8,
+		Name:    "request_attempts",
+		Up: `
+-- 请求尝试（MR-015）：一个逻辑请求的每次真实上游尝试单独记录。
+-- 幂等键 (request_id, attempt_id)；不保存正文；终态区分成功/失败/取消/部分/未知。
+CREATE TABLE request_attempts (
+	id                 TEXT PRIMARY KEY,
+	request_id         TEXT NOT NULL,
+	attempt_id         TEXT NOT NULL,
+	account_id         TEXT NOT NULL DEFAULT '',
+	provider_id        TEXT NOT NULL DEFAULT '',
+	logical_model      TEXT NOT NULL DEFAULT '',
+	actual_model       TEXT NOT NULL DEFAULT '',
+	protocol           TEXT NOT NULL DEFAULT 'chat.completions',
+	access_token_id    TEXT NOT NULL DEFAULT '',
+	project_id         TEXT NOT NULL DEFAULT '',
+	status             TEXT NOT NULL DEFAULT 'started',  -- started|success|failed|cancelled|partial|unknown|interrupted
+	input_tokens       INTEGER NOT NULL DEFAULT 0,
+	output_tokens      INTEGER NOT NULL DEFAULT 0,
+	cache_read_tokens  INTEGER NOT NULL DEFAULT 0,
+	cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+	reasoning_tokens   INTEGER NOT NULL DEFAULT 0,
+	metering           TEXT NOT NULL DEFAULT 'unknown',  -- exact|reported|estimated|incomplete|unknown
+	latency_ms         INTEGER NOT NULL DEFAULT 0,
+	status_code        INTEGER NOT NULL DEFAULT 0,
+	error_class        TEXT NOT NULL DEFAULT '',
+	reason_code        TEXT NOT NULL DEFAULT '',
+	price_version      TEXT NOT NULL DEFAULT '',
+	occurred_at        TEXT NOT NULL,
+	finished_at        TEXT NOT NULL DEFAULT '',
+	UNIQUE (request_id, attempt_id)
+);
+CREATE INDEX idx_request_attempts_request ON request_attempts(request_id);
+CREATE INDEX idx_request_attempts_account ON request_attempts(account_id, occurred_at);
+`,
+	},
 }
 
 // KnownVersion 当前程序支持的最高 schema 版本。

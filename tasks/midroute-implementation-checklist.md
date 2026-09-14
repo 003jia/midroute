@@ -287,9 +287,9 @@ P0 · 部分实现 · 对应 M2/M4/M5、US-006/009/011、FR-46/47 · 依赖：MR
 目标：`internal/api`、`internal/repository`；新增 `internal/usage` 记录服务、`internal/audit`、请求查询 API。
 实现步骤：①转发前记录请求与尝试元数据，禁止保存正文；②记录 Provider/Account/逻辑模型/实际模型快照和 reason_code；③input/output/cache/reasoning 原义入库，终态区分成功、失败、取消、部分结果、未知；④终态写入使用独立有界 context，不因客户端取消直接丢记录；⑤处理 SQLite 失败并暴露告警，幂等更新与启动恢复识别未完成请求。
 
-- [ ] 同一尝试重复提交不重复计费，多次真实重试的消耗分别保留。
+- [x] 同一尝试重复提交不重复计费，多次真实重试的消耗分别保留。（2026-09-14：request_attempts 幂等键 (request_id,attempt_id)，CreateAttempt 冲突忽略、FinishAttempt 重复提交只更新同一行；TestAttemptIdempotency；failover 每次尝试独立落库，TestRequestAttemptsRecorded 验证 2 次尝试）
 - [ ] 断流/缺 usage 显示 incomplete/unknown，不能落成“成功且 0 Token”。
-- [ ] 请求详情可查所有尝试、实际模型和选择原因；删除账户不破坏历史归属。
+- [x] 请求详情可查所有尝试、实际模型和选择原因；删除账户不破坏历史归属。（2026-09-14：GET /api/v1/requests、/api/v1/requests/{request_id} 返回每次尝试（account/logical/actual model、error_class、reason_code、tokens、metering）；attempts 快照 account_id 故删除账户不影响历史）
 
 ### MR-016 项目访问令牌与推理权限
 

@@ -20,6 +20,7 @@ import (
 	"midroute/internal/router"
 	"midroute/internal/session"
 	"midroute/internal/testutil"
+	"midroute/internal/usage/attempts"
 )
 
 // buildServer 组装完整服务（账户目标由 Provider.base_url 决定，指向 mock 上游）。
@@ -29,7 +30,9 @@ func buildServer(t *testing.T) (*httptest.Server, *App) {
 	vault := credentials.NewInMemoryVault()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	app := NewApp(store, vault, nil, log)
-	app.Router = router.New(store, app.ResolveForRouter, log)
+	rt := router.New(store, app.ResolveForRouter, log)
+	rt.Attempts = attempts.NewRecorder(store)
+	app.Router = rt
 
 	guard := session.NewGuard(true, "")
 	srv := httpserver.New(log, httpserver.NewDBStore(1), guard)
@@ -634,6 +637,103 @@ func TestRefreshJobAPI(t *testing.T) {
 		t.Fatalf("jobs len=%d", len(list.Data))
 	}
 	_ = ctx
+}
+
+// MR-015：每次真实上游尝试单独记录；断流=partial；幂等（request+attempt）。
+func TestRequestAttemptsRecorded(t *testing.T) {
+	// 候选1 429（失败，安全切换），候选2 成功
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "rate limited", 429)
+	}))
+	defer bad.Close()
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "application/json")
+		io.WriteString(w, `{"id":"c2","object":"chat.completion","created":1,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}`)
+	}))
+	defer good.Close()
+
+	ts, _ := buildServer(t)
+	base := ts.URL
+	// provider base_url 指向 bad；用两个账户分别指向两个 mock
+	var prov struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, mustPost(t, base+"/api/v1/providers", `{"kind":"openai","name":"bad","base_url":"`+bad.URL+`"}`), &prov)
+	var prov2 struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, mustPost(t, base+"/api/v1/providers", `{"kind":"openai","name":"good","base_url":"`+good.URL+`"}`), &prov2)
+	var accBad, accGood struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, mustPost(t, base+"/api/v1/accounts",
+		`{"provider_id":"`+prov.ID+`","name":"bad","api_key":"sk-test-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`), &accBad)
+	decodeBody(t, mustPost(t, base+"/api/v1/accounts",
+		`{"provider_id":"`+prov2.ID+`","name":"good","api_key":"sk-test-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`), &accGood)
+
+	// 策略：候选1=bad（priority1），候选2=good（priority2）→ 触发失败切换
+	http.DefaultClient.Do(mustReq(t, http.MethodPut, base+"/api/v1/routing-policies/alias-x",
+		`{"name":"x","candidates":[{"account_id":"`+accBad.ID+`","model_id":"gpt-4o","priority":1,"weight":1},{"account_id":"`+accGood.ID+`","model_id":"gpt-4o","priority":2,"weight":1}],"enabled":true}`))
+
+	// /v1/* 走项目令牌鉴权：先创建推理令牌
+	respTok := mustPost(t, base+"/api/v1/tokens", `{"name":"test"}`)
+	var tok struct {
+		Token string `json:"token"`
+	}
+	decodeBody(t, respTok, &tok)
+	reqChat := mustReq(t, http.MethodPost, base+"/v1/chat/completions",
+		`{"model":"alias-x","messages":[{"role":"user","content":"hi"}]}`)
+	reqChat.Header.Set("Authorization", "Bearer "+tok.Token)
+	resp, _ := http.DefaultClient.Do(reqChat)
+	if resp.StatusCode != 200 {
+		t.Fatalf("chat: %d", resp.StatusCode)
+	}
+	var chat struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, resp, &chat)
+	_ = chat
+
+	// 从近期请求反查 request_id（mock 上游透传了自身 id，不注入请求 id）
+	resp, _ = http.Get(base + "/api/v1/requests")
+	var recents struct {
+		Data []repository.RequestAttempt `json:"data"`
+	}
+	decodeBody(t, resp, &recents)
+	var requestID string
+	seen := map[string]bool{}
+	for _, a := range recents.Data {
+		seen[a.AccountID] = true
+		if seen[accBad.ID] && seen[accGood.ID] && a.RequestID != "" {
+			requestID = a.RequestID
+			break
+		}
+	}
+	if requestID == "" {
+		t.Fatalf("could not find request_id from attempts")
+	}
+
+	// 请求详情应含两次尝试：bad 失败（rate_limited）、good 成功（带 usage）
+	resp, _ = http.Get(base + "/api/v1/requests/" + requestID)
+	var detail struct {
+		Data []repository.RequestAttempt `json:"data"`
+	}
+	decodeBody(t, resp, &detail)
+	if len(detail.Data) != 2 {
+		t.Fatalf("attempts=%d want 2", len(detail.Data))
+	}
+	byAccount := map[string]repository.RequestAttempt{}
+	for _, a := range detail.Data {
+		byAccount[a.AccountID] = a
+	}
+	badAtt := byAccount[accBad.ID]
+	goodAtt := byAccount[accGood.ID]
+	if badAtt.Status != "failed" || badAtt.ErrorClass != "rate_limited" {
+		t.Fatalf("bad attempt: %+v", badAtt)
+	}
+	if goodAtt.Status != "success" || goodAtt.InputTokens != 4 || goodAtt.Metering != "reported" {
+		t.Fatalf("good attempt: %+v", goodAtt)
+	}
 }
 
 func decodeBody(t *testing.T, resp *http.Response, out any) {

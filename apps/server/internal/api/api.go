@@ -93,6 +93,8 @@ func (a *App) Mount(srv *httpserver.Server) {
 	srv.MountFunc("/api/v1/quota-pools/", a.handleQuotaPoolSnapshots)
 	srv.MountFunc("/api/v1/jobs", a.handleJobs)
 	srv.MountFunc("/api/v1/jobs/", a.handleJob)
+	srv.MountFunc("/api/v1/requests", a.handleRequests)
+	srv.MountFunc("/api/v1/requests/", a.handleRequestDetail)
 	srv.MountFunc("/api/v1/oauth/", a.oauthAction)
 	// 网关（推理）API：项目令牌鉴权（httpserver 对 /v1/* 不施加管理 Guard）
 	srv.MountFunc("/v1/models", a.requireToken(a.handleGatewayModels))
@@ -687,6 +689,41 @@ func (a *App) providerAction(w http.ResponseWriter, r *http.Request) {
 	default:
 		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
 	}
+}
+
+// -------- 请求详情（MR-015）--------
+
+// handleRequests 列出近期请求尝试。
+func (a *App) handleRequests(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
+		return
+	}
+	attempts, err := a.Store.ListRecentAttempts(r.Context(), 100)
+	if err != nil {
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询请求失败", err))
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, map[string]any{"data": attempts})
+}
+
+// handleRequestDetail 按 request_id 查全部尝试。
+func (a *App) handleRequestDetail(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) != 4 {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "路径无效"))
+		return
+	}
+	attempts, err := a.Store.ListAttemptsByRequest(r.Context(), parts[3])
+	if err != nil {
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询请求详情失败", err))
+		return
+	}
+	if len(attempts) == 0 {
+		httpserver.WriteError(w, errs.New(errs.CodeNotFound, "请求不存在"))
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, map[string]any{"request_id": parts[3], "data": attempts})
 }
 
 // -------- 额度池与快照（MR-009）--------

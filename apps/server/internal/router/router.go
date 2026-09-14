@@ -37,11 +37,43 @@ type ResolvedTarget struct {
 // Resolver 从账户 ID 解析出目标（含凭据解密）。
 type Resolver func(ctx context.Context, accountID string) (*ResolvedTarget, error)
 
+// AttemptInfo 一次尝试的开始信息（不含正文/密钥）。
+type AttemptInfo struct {
+	RequestID    string
+	AccountID    string
+	ProviderID   string
+	LogicalModel string
+	ActualModel  string
+	Protocol     string
+}
+
+// AttemptResult 一次尝试的终态。
+type AttemptResult struct {
+	Status           string // success|failed|cancelled|partial|unknown
+	InputTokens      int64
+	OutputTokens     int64
+	CacheReadTokens  int64
+	CacheWriteTokens int64
+	ReasoningTokens  int64
+	Metering         string // exact|reported|estimated|incomplete|unknown
+	LatencyMS        int64
+	StatusCode       int
+	ErrorClass       string
+	ReasonCode       string
+}
+
+// AttemptHook 尝试记录钩子（由 usage.Recorder 实现；nil 时不做记录）。
+type AttemptHook interface {
+	StartAttempt(ctx context.Context, info AttemptInfo) string
+	FinishAttempt(ctx context.Context, requestID, attemptID string, res AttemptResult)
+}
+
 // Router 路由引擎。
 type Router struct {
-	store   *repository.Store
-	resolve Resolver
-	log     *slog.Logger
+	store    *repository.Store
+	resolve  Resolver
+	log      *slog.Logger
+	Attempts AttemptHook
 }
 
 // New 创建 Router。
@@ -143,7 +175,7 @@ func (r *Router) Forward(ctx context.Context, alias string, req *connectors.Chat
 	}
 	decision := &Decision{RequestID: requestID, Alias: alias, PolicyID: policyID, CreatedAt: time.Now().Unix()}
 	lastErr := ErrNoCandidate
-	for _, c := range cands {
+	for i, c := range cands {
 		target, err := r.resolve(ctx, c.AccountID)
 		if err != nil {
 			lastErr = err
@@ -155,13 +187,18 @@ func (r *Router) Forward(ctx context.Context, alias string, req *connectors.Chat
 		decision.Candidates = append(decision.Candidates, decision.Selected)
 		upstreamReq := *req
 		upstreamReq.Model = c.ModelID
+		attemptID := r.startAttempt(ctx, requestID, c, alias, i)
+		start := time.Now()
 		resp, err := target.Conn.Forward(ctx, target.Target, &upstreamReq)
+		latency := time.Since(start).Milliseconds()
 		if err == nil {
+			r.finishAttempt(ctx, requestID, attemptID, resp, latency, "success")
 			decision.ReasonCodes = append(decision.ReasonCodes, "ok")
 			return resp, decision, nil
 		}
+		r.finishAttemptError(ctx, requestID, attemptID, err, latency, "failed")
 		lastErr = err
-		decision.ReasonCodes = append(decision.ReasonCodes, "failover:"+err.Error())
+		decision.ReasonCodes = append(decision.ReasonCodes, "failover")
 		if !safeToRetry(err) {
 			break
 		}
@@ -183,7 +220,7 @@ func (r *Router) ForwardStream(ctx context.Context, alias string, req *connector
 		streamed = true
 		return onChunk(b)
 	}
-	for _, c := range cands {
+	for i, c := range cands {
 		target, err := r.resolve(ctx, c.AccountID)
 		if err != nil {
 			lastErr = err
@@ -195,13 +232,22 @@ func (r *Router) ForwardStream(ctx context.Context, alias string, req *connector
 		decision.Candidates = append(decision.Candidates, decision.Selected)
 		upstreamReq := *req
 		upstreamReq.Model = c.ModelID
+		attemptID := r.startAttempt(ctx, requestID, c, alias, i)
+		start := time.Now()
 		usage, err := target.Conn.ForwardStream(ctx, target.Target, &upstreamReq, wrapped)
+		latency := time.Since(start).Milliseconds()
 		if err == nil {
+			r.finishAttemptStream(ctx, requestID, attemptID, usage, latency, "success")
 			decision.ReasonCodes = append(decision.ReasonCodes, "ok")
 			return usage, decision, nil
 		}
+		status := "failed"
+		if streamed {
+			status = "partial" // 已输出内容后断流
+		}
+		r.finishAttemptStream(ctx, requestID, attemptID, usage, latency, status, err)
 		lastErr = err
-		decision.ReasonCodes = append(decision.ReasonCodes, "failover:"+err.Error())
+		decision.ReasonCodes = append(decision.ReasonCodes, "failover")
 		if streamed {
 			break // 已输出内容，禁止重放（US-006）
 		}
@@ -210,6 +256,87 @@ func (r *Router) ForwardStream(ctx context.Context, alias string, req *connector
 		}
 	}
 	return nil, decision, lastErr
+}
+
+// startAttempt 记录一次尝试开始；返回 attempt_id（hook 未装配时为 ""）。
+func (r *Router) startAttempt(ctx context.Context, requestID string, c domain.Candidate, alias string, idx int) string {
+	if r.Attempts == nil {
+		return ""
+	}
+	info := AttemptInfo{
+		RequestID: requestID, AccountID: c.AccountID,
+		LogicalModel: alias, ActualModel: c.ModelID, Protocol: "chat.completions",
+	}
+	return r.Attempts.StartAttempt(ctx, info)
+}
+
+func (r *Router) finishAttempt(ctx context.Context, requestID, attemptID string, resp *connectors.ChatResponse, latencyMS int64, status string) {
+	if r.Attempts == nil || attemptID == "" {
+		return
+	}
+	res := AttemptResult{Status: status, LatencyMS: latencyMS, ReasonCode: "ok"}
+	if resp != nil && resp.Usage != nil {
+		res.InputTokens = resp.Usage.PromptTokens
+		res.OutputTokens = resp.Usage.CompletionTokens
+		res.Metering = "reported"
+		if resp.Usage.PromptTokensDetails != nil {
+			res.CacheReadTokens = resp.Usage.PromptTokensDetails.CachedTokens
+		}
+	} else {
+		res.Metering = "unknown"
+	}
+	r.Attempts.FinishAttempt(ctx, requestID, attemptID, res)
+}
+
+func (r *Router) finishAttemptError(ctx context.Context, requestID, attemptID string, err error, latencyMS int64, status string) {
+	if r.Attempts == nil || attemptID == "" {
+		return
+	}
+	res := AttemptResult{Status: status, LatencyMS: latencyMS, Metering: "unknown", ErrorClass: errClass(err), ReasonCode: "upstream_error"}
+	if _, ok := err.(*connectors.UpstreamError); ok {
+		res.ReasonCode = "upstream_error"
+	}
+	if e, ok := err.(*connectors.UpstreamError); ok {
+		res.StatusCode = e.Status
+	}
+	r.Attempts.FinishAttempt(ctx, requestID, attemptID, res)
+}
+
+func (r *Router) finishAttemptStream(ctx context.Context, requestID, attemptID string, usage *connectors.Usage, latencyMS int64, status string, err ...error) {
+	if r.Attempts == nil || attemptID == "" {
+		return
+	}
+	res := AttemptResult{Status: status, LatencyMS: latencyMS, Metering: "unknown"}
+	if usage != nil {
+		res.InputTokens = usage.InputTokens
+		res.OutputTokens = usage.OutputTokens
+		res.CacheReadTokens = usage.CacheTokens
+		res.Metering = "reported"
+	}
+	if len(err) > 0 && err[0] != nil {
+		res.ErrorClass = errClass(err[0])
+		res.ReasonCode = "upstream_error"
+	}
+	r.Attempts.FinishAttempt(ctx, requestID, attemptID, res)
+}
+
+func errClass(err error) string {
+	switch {
+	case errors.Is(err, connectors.ErrRateLimited):
+		return "rate_limited"
+	case errors.Is(err, connectors.ErrAuth):
+		return "auth"
+	case errors.Is(err, connectors.ErrTimeout):
+		return "timeout"
+	case errors.Is(err, connectors.ErrNetwork):
+		return "network"
+	case errors.Is(err, connectors.ErrTruncated):
+		return "truncated"
+	case errors.Is(err, connectors.ErrQuotaExhausted):
+		return "quota_exhausted"
+	default:
+		return "upstream_error"
+	}
 }
 
 // safeToRetry 仅在可安全重试的错误上切换（429、超时、网络、截断、5xx）。

@@ -25,6 +25,7 @@ import (
 	"midroute/internal/repository"
 	"midroute/internal/router"
 	"midroute/internal/session"
+	"midroute/internal/usage/attempts"
 )
 
 func main() {
@@ -71,8 +72,18 @@ func run() error {
 
 	// 业务装配
 	store := repository.New(conn)
+
+	// 重启恢复：把上次遗留的 started 尝试标为 interrupted（结果未知，不重放）。
+	if n, err := store.MarkStaleAttemptsInterrupted(ctx); err == nil && n > 0 {
+		log.Info("interrupted attempts marked", "count", n)
+	}
+	if n, err := store.MarkInterruptedRefreshJobs(ctx); err == nil && n > 0 {
+		log.Info("interrupted refresh jobs marked", "count", n)
+	}
+
 	app := api.NewApp(store, v, nil, log)
 	rt := router.New(store, app.ResolveForRouter, log)
+	rt.Attempts = attempts.NewRecorder(store)
 	app.Router = rt
 
 	// OAuth 服务（M3）：按平台注册；Codex 端点证据见 docs/provider-capabilities.md §2.1。

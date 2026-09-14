@@ -23,6 +23,7 @@ import (
 	"midroute/internal/protocols/responses"
 	"midroute/internal/repository"
 	"midroute/internal/router"
+	"midroute/internal/usage/attempts"
 )
 
 // ============================================================
@@ -56,7 +57,8 @@ func (a *App) requireToken(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		defer release()
-		next(w, r.WithContext(context.WithValue(r.Context(), tokenCtxKey{}, tok)))
+		ctx := attempts.WithIdentity(r.Context(), tok.ID, tok.ProjectID)
+		next(w, r.WithContext(context.WithValue(ctx, tokenCtxKey{}, tok)))
 	}
 }
 

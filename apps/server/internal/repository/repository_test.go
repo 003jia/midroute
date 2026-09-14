@@ -165,4 +165,55 @@ func TestAccountModelAndUsageRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAttemptIdempotency(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t)
+
+	// 幂等键 (request_id, attempt_id)：CreateAttempt 重复不新增行
+	for i := 0; i < 2; i++ {
+		if err := store.CreateAttempt(ctx, RequestAttempt{
+			ID: "ra1", RequestID: "req1", AttemptID: "att1", AccountID: "a1", LogicalModel: "x", ActualModel: "gpt-4o",
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// FinishAttempt 重复提交不会新增计费（仍是同一行，Token 只记一次）
+	f := RequestAttempt{
+		RequestID: "req1", AttemptID: "att1", Status: "success",
+		InputTokens: 10, OutputTokens: 5, Metering: "reported",
+	}
+	for i := 0; i < 3; i++ {
+		if err := store.FinishAttempt(ctx, f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	list, err := store.ListAttemptsByRequest(ctx, "req1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("attempts=%d want 1 (idempotent)", len(list))
+	}
+	if list[0].Status != "success" || list[0].InputTokens != 10 {
+		t.Fatalf("attempt=%+v", list[0])
+	}
+}
+
+// 重启恢复：started 尝试标 interrupted。
+func TestMarkStaleAttemptsInterrupted(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t)
+	_ = store.CreateAttempt(ctx, RequestAttempt{ID: "ra1", RequestID: "r1", AttemptID: "a1"})
+	_ = store.CreateAttempt(ctx, RequestAttempt{ID: "ra2", RequestID: "r2", AttemptID: "a2"})
+	_ = store.FinishAttempt(ctx, RequestAttempt{RequestID: "r2", AttemptID: "a2", Status: "success"})
+	n, err := store.MarkStaleAttemptsInterrupted(ctx)
+	if err != nil || n != 1 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	ra1, _ := store.ListAttemptsByRequest(ctx, "r1")
+	if len(ra1) != 1 || ra1[0].Status != "interrupted" {
+		t.Fatalf("r1=%+v", ra1)
+	}
+}
+
 func strPtr(s string) *string { return &s }
