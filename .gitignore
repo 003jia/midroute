@@ -21,3 +21,6 @@ node_modules/
 # Upstream clones keep their own git; integration repo treats them as external pinned deps
 # work/ is NOT committed here. See PINNED_COMMITS for freeze metadata.
 /work/
+
+# Local security-scan history (mimosa plugin)
+.mimosa/

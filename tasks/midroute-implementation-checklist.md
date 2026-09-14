@@ -23,6 +23,10 @@
 
 2026-09-07 M3 开发（未提交工作区）：按依赖完成 MR-003 缺口收口（domain 枚举/migration v2/前向拒绝/合约文档，ISS-12 修复）、MR-006 初始能力矩阵、MR-007 OAuth 模块（mock 层）、MR-008 Codex 额度头解析器；`./build/test.sh` 全量通过（新增 oauth/quota 包测试，oauth 含 race 检测）。管理 API 接线 OAuth 端点待 MR-002 会话安全落地后进行；所有真实凭据验收项保持待完成。证据见 `outputs/validation/MR-003-2026-09-07.md` 与 `outputs/validation/MR-006-007-008-2026-09-07.md`。
 
+2026-09-08 M0-M2 收口（提交 a8ae51a）：页面托管/流式防重放/用量落库可靠性/账户生命周期（ISS-01/02/03/05，MR-001 全部三框、MR-002 两框、MR-003 两框、MR-004 两框勾选）；MR-001 基线验收（0ec517c）。遗留 ISS-08（冒烟隔离性）当时未实际修复。
+
+2026-09-14 安全边界与脚本收口：MR-002 全部三框勾选（ISS-07 会话/Host/CSRF + 冒烟 403 断言），MR-002 状态改已验收；ISS-04/06/08 修复（备份/扫描/冒烟）。P0 问题已全部修复，P1 剩 7 项、P2 剩 2 项。证据见 `outputs/validation/MR-002-security-2026-09-14.md`。
+
 PRD 原有 US-001–US-011 保留；新增需求以 FR-31–FR-47 和下文任务落实。原来的 66 个复合验收条目尚未逐项签收，不能把未勾选数当作开发完成百分比。
 
 ## 2. 交付顺序与依赖
@@ -122,7 +126,7 @@ M0–M7 继续表示原 PRD 的功能分组；D0–D4 是交付批次，不改�
 
 ### MR-001 工程入口、工具门禁与版本基线
 
-P0 · 部分实现 · 对应 M0/M1、US-001/002 · 依赖：无。
+P0 · 已验收（2026-09-08，基线提交 a8ae51a；冒烟隔离性 ISS-08 于 2026-09-14 补齐） · 对应 M0/M1、US-001/002 · 依赖：无。
 
 目标文件：`.gitignore`、`build/test.sh`、`build/build.sh`、`build/smoke-test.sh`、前端 lint/格式配置。
 实现步骤：①排除嵌套 `node_modules`、前端 dist、缓存和运行数据；②保留 Go 子模块，以根脚本运行全量测试并加入 go vet；③规范配置按 §5 落地，存量格式整理单独处理；④冒烟改用唯一临时目录和动态端口，只清理本次创建的资源；⑤检查待提交清单和密钥扫描后建立源码 Git 基线，生成产物不入库。
@@ -133,13 +137,13 @@ P0 · 部分实现 · 对应 M0/M1、US-001/002 · 依赖：无。
 
 ### MR-002 单服务管理页与访问边界
 
-P0 · 部分实现 · 对应 M1/M6、US-001/010 · 依赖：MR-001。
+P0 · 已验收（2026-09-14 收口安全边界；页面托管 2026-09-08） · 对应 M1/M6、US-001/010 · 依赖：MR-001。
 
 目标文件：`internal/config`、`internal/httpserver`、`cmd/server/main.go`、`build/run.sh`、`build/smoke-test.sh`。
 实现步骤：①用明确 `StaticDir` 托管 `dist/web`，生产缺资源时给出启动错误；②SPA 路由回落仅限管理页面，API/资源不存在仍返回正确 404；③从实际监听地址核验本地/远程模式，loopback 免重复输入；④远程使用管理员认证建立受保护会话，加入 Host/Origin 校验和写请求 CSRF 防护；⑤不信任任意转发头，代理部署采用显式鉴权配置。
 
 - [x] 单进程下 `/`、账户页刷新、JS/CSS 资源均成功；未知 API 不返回 HTML。（2026-09-08：main.go 挂载 MIDROUTE_STATIC_DIR，SPA 回退 index.html；`/api`、`/v1` 未知路径返回 JSON 404；cmd/server 三项测试覆盖）
-- [ ] 本机进入不重复输入密钥；远程无认证、伪造 Host/Origin、跨站写请求被拒绝；退出后受保护会话失效。
+- [x] 本机进入不重复输入密钥；远程无认证、伪造 Host/Origin、跨站写请求被拒绝；退出后受保护会话失效。（2026-09-14：session.go 免登录路径强制 loopback 字面量 Host（DNS rebinding 防护）、写请求 Origin/Referer 同源校验、Bearer 登录 + HttpOnly/SameSite=Strict 会话 Cookie + DELETE 退出即失效；httpserver/session 共 6 个安全测试含 race，冒烟脚本含伪造 Host 403 断言）
 - [x] 冒烟验证 HTTP 状态及页面内容，路径穿越与资源缺失有针对性测试。（2026-09-08：smoke-test.sh 页面断言；main_test.go TestStaticBlocksPathTraversal）
 
 ### MR-003 领域合约与数据库增量迁移

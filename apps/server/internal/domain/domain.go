@@ -116,11 +116,11 @@ type Candidate struct {
 // Token 推理访问令牌（PRD M2 数据模型；MR-016）。
 // 只保存哈希与前缀；明文仅在创建响应中出现一次，绝不落库/落日志。
 type Token struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	KeyHash     string `json:"-"` // 不序列化
-	KeyPrefix   string `json:"key_prefix"`
-	Enabled     bool   `json:"enabled"`
-	CreatedAt   string `json:"created_at"`
-	LastUsedAt  string `json:"last_used_at"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	KeyHash    string `json:"-"` // 不序列化
+	KeyPrefix  string `json:"key_prefix"`
+	Enabled    bool   `json:"enabled"`
+	CreatedAt  string `json:"created_at"`
+	LastUsedAt string `json:"last_used_at"`
 }

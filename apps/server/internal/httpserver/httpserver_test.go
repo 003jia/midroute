@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"log/slog"
@@ -66,6 +67,7 @@ func TestProtectedRouteRequiresAuthWhenRemote(t *testing.T) {
 		t.Fatalf("remote without key: got %d", w.Code)
 	}
 	req.RemoteAddr = "127.0.0.1:1234"
+	req.Host = "127.0.0.1"
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -82,5 +84,160 @@ func TestProtectedRouteWithValidKey(t *testing.T) {
 	h.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("valid key should reach route (404): got %d", w.Code)
+	}
+}
+
+// TestForgedHostRejectedOnFreePath DNS rebinding 防护：本地免登录路径上
+// 非法字面量 Host（example.com 解析到回环）必须被拒绝。
+func TestForgedHostRejectedOnFreePath(t *testing.T) {
+	h := newTestServer(t, true)
+	for _, host := range []string{"example.com", "evil.attacker.net:18100", ""} {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/accounts", nil)
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Host = host
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("Host %q should be rejected with 403, got %d", host, w.Code)
+		}
+	}
+	// loopback 字面量 Host 放行
+	for _, host := range []string{"127.0.0.1:18100", "localhost:18100", "[::1]:18100"} {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/accounts", nil)
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Host = host
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code == http.StatusForbidden {
+			t.Fatalf("Host %q should be allowed", host)
+		}
+	}
+}
+
+// TestCrossSiteWriteRejected CSRF 防护：跨站 Origin/Referer 的写请求被拒，
+// 同源与无 Origin 的程序客户端放行。
+func TestCrossSiteWriteRejected(t *testing.T) {
+	h := newTestServer(t, true)
+	post := func(origin, referer string) int {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/accounts", strings.NewReader("{}"))
+		req.RemoteAddr = "127.0.0.1:1234"
+		req.Host = "127.0.0.1:18100"
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		if referer != "" {
+			req.Header.Set("Referer", referer)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w.Code
+	}
+	if got := post("http://evil.example.com", ""); got != http.StatusForbidden {
+		t.Fatalf("cross-site Origin write: got %d want 403", got)
+	}
+	if got := post("", "http://evil.example.com/page"); got != http.StatusForbidden {
+		t.Fatalf("cross-site Referer write: got %d want 403", got)
+	}
+	if got := post("http://127.0.0.1:18100", ""); got == http.StatusForbidden {
+		t.Fatalf("same-origin write must pass, got %d", got)
+	}
+	if got := post("", ""); got == http.StatusForbidden {
+		t.Fatalf("non-browser write (no Origin/Referer) must pass, got %d", got)
+	}
+}
+
+// TestSessionLoginLogout 受保护会话全流程：Bearer 登录 → Cookie 访问 →
+// 退出 → Cookie 失效。
+func TestSessionLoginLogout(t *testing.T) {
+	h := newTestServer(t, false) // 远程模式
+	ts := httptest.NewServer(h)
+	defer ts.Close()
+	client := &http.Client{
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+
+	// 无凭据访问被拒
+	resp, err := client.Get(ts.URL + "/api/v1/models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("no credentials: got %d", resp.StatusCode)
+	}
+
+	// Bearer 登录签发会话
+	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/session", nil)
+	req.Header.Set("Authorization", "Bearer test-admin-key")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login: got %d", resp.StatusCode)
+	}
+	var cookies []*http.Cookie
+	for _, c := range resp.Cookies() {
+		if c.Name == session.CookieName {
+			cookies = append(cookies, c)
+		}
+	}
+	if len(cookies) != 1 {
+		t.Fatalf("session cookie not set")
+	}
+	if !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteStrictMode {
+		t.Fatalf("cookie flags wrong: %+v", cookies[0])
+	}
+
+	// 仅凭 Cookie 访问受保护路由（到达 mux 返回 404 即视为通过 Guard）
+	req, _ = http.NewRequest(http.MethodGet, ts.URL+"/api/v1/models", nil)
+	req.AddCookie(cookies[0])
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("cookie access: got %d want 404 (passed guard)", resp.StatusCode)
+	}
+
+	// 退出
+	req, _ = http.NewRequest(http.MethodDelete, ts.URL+"/api/v1/session", nil)
+	req.AddCookie(cookies[0])
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out map[string]any
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || out["revoked"] != true {
+		t.Fatalf("logout: %d %v", resp.StatusCode, out)
+	}
+
+	// 旧 Cookie 已失效
+	req, _ = http.NewRequest(http.MethodGet, ts.URL+"/api/v1/models", nil)
+	req.AddCookie(cookies[0])
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("revoked cookie must fail: got %d", resp.StatusCode)
+	}
+}
+
+// TestSessionEndpointRejectsLocalFreeMode 本地免登录模式下不发会话。
+func TestSessionEndpointRejectsLocalFreeMode(t *testing.T) {
+	h := newTestServer(t, true)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/session", nil)
+	req.RemoteAddr = "127.0.0.1:1234"
+	req.Host = "127.0.0.1"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("local free mode session issue should 400, got %d", w.Code)
 	}
 }

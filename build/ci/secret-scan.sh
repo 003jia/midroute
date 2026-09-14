@@ -13,16 +13,19 @@ scan() {
     -not -path "$ROOT/dist/*" \
     -not -path "$ROOT/data/*" \
     -not -path "$ROOT/backups/*" \
+    -not -path "$ROOT/.mimosa/*" \
     -not -path "$ROOT/node_modules/*" \
     -not -name "*.lock" \
     -not -name "package-lock.json" \
     -not -name "*_test.go" \
     -print0 | while IFS= read -r -d '' file; do
-      # 典型密钥/凭据模式（vaultctl 的假名、真实 Key、token）
-      grep -HEnE '(sk-[A-Za-z0-9]{16,}|sk-ant-[A-Za-z0-9]{16,}|AIza[A-Za-z0-9_-]{16,}|Bearer [A-Za-z0-9._-]{20,}|api[_-]?key[[:space:]]*[:=][[:space:]]*["'"'"'][A-Za-z0-9]{16,}|cmp_admin_[A-Za-z0-9]{8,}|secret-key[[:space:]]*:[[:space:]]*[A-Za-z0-9]{8,})' "$file" 2>/dev/null \
-        | grep -vE ':([0-9]+):[[:space:]]*(#|//|--|/\*|\*)' \
-        || true
-    done
+    # 典型密钥/凭据模式（vaultctl 的假名、真实 Key、token）。
+    # 命中只报告 文件:行号，不回显行内容，避免疑似密钥进入 CI 日志。
+    grep -HEnE '(sk-[A-Za-z0-9]{16,}|sk-ant-[A-Za-z0-9]{16,}|AIza[A-Za-z0-9_-]{16,}|Bearer [A-Za-z0-9._-]{20,}|api[_-]?key[[:space:]]*[:=][[:space:]]*["'"'"'][A-Za-z0-9]{16,}|cmp_admin_[A-Za-z0-9]{8,}|secret-key[[:space:]]*:[[:space:]]*[A-Za-z0-9]{8,})' "$file" 2>/dev/null \
+      | grep -vE ':([0-9]+):[[:space:]]*(#|//|--|/\*|\*)' \
+      | sed -E 's/^([^:]+):([0-9]+):.*$/\1:\2 (疑似密钥，内容已隐藏)/' \
+      || true
+  done
 }
 hits="$(scan)"
 if [ -n "$hits" ]; then
