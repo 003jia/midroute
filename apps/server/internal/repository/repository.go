@@ -775,13 +775,17 @@ type RequestAttempt struct {
 
 // CreateAttempt 记录一次尝试的开始（幂等：同 request+attempt 冲突时忽略）。
 func (s *Store) CreateAttempt(ctx context.Context, a RequestAttempt) error {
+	at := a.OccurredAt
+	if at == "" {
+		at = now()
+	}
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO request_attempts(id, request_id, attempt_id, account_id, provider_id, logical_model, actual_model,
 			protocol, access_token_id, project_id, status, occurred_at)
 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(request_id, attempt_id) DO NOTHING`,
 		a.ID, a.RequestID, a.AttemptID, a.AccountID, a.ProviderID, a.LogicalModel, a.ActualModel,
-		a.Protocol, a.AccessTokenID, a.ProjectID, "started", now())
+		a.Protocol, a.AccessTokenID, a.ProjectID, "started", at)
 	return err
 }
 
@@ -868,6 +872,109 @@ func (s *Store) MarkStaleAttemptsInterrupted(ctx context.Context) (int, error) {
 	}
 	n, _ := res.RowsAffected()
 	return int(n), nil
+}
+
+// -------- price_versions（MR-019）--------
+
+// UpsertPriceVersion 写入价格版本（同一模型可多版本）。
+func (s *Store) UpsertPriceVersion(ctx context.Context, p domain.PriceVersion) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO price_versions(id, provider_id, model_id, input_price_nano, output_price_nano,
+			cache_read_price_nano, cache_write_price_nano, currency, effective_at, source)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		p.ID, p.ProviderID, p.ModelID, p.InputPriceNano, p.OutputPriceNano,
+		p.CacheReadPriceNano, p.CacheWritePriceNano, p.Currency, p.EffectiveAt, p.Source)
+	return err
+}
+
+// PriceAt 取某模型在 t 时刻生效的价格版本（最新生效且 <= t）。
+func (s *Store) PriceAt(ctx context.Context, modelID, t string) (domain.PriceVersion, bool, error) {
+	var p domain.PriceVersion
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, provider_id, model_id, input_price_nano, output_price_nano, cache_read_price_nano, cache_write_price_nano, currency, effective_at, source
+		FROM price_versions WHERE model_id=? AND effective_at<=? ORDER BY effective_at DESC LIMIT 1`,
+		modelID, t).
+		Scan(&p.ID, &p.ProviderID, &p.ModelID, &p.InputPriceNano, &p.OutputPriceNano,
+			&p.CacheReadPriceNano, &p.CacheWritePriceNano, &p.Currency, &p.EffectiveAt, &p.Source)
+	if err == sql.ErrNoRows {
+		return domain.PriceVersion{}, false, nil
+	}
+	if err != nil {
+		return domain.PriceVersion{}, false, err
+	}
+	return p, true, nil
+}
+
+// ListPriceVersions 列出价格版本。
+func (s *Store) ListPriceVersions(ctx context.Context, modelID string) ([]domain.PriceVersion, error) {
+	q := `SELECT id, provider_id, model_id, input_price_nano, output_price_nano, cache_read_price_nano, cache_write_price_nano, currency, effective_at, source FROM price_versions`
+	args := []any{}
+	if modelID != "" {
+		q += ` WHERE model_id=?`
+		args = append(args, modelID)
+	}
+	q += ` ORDER BY effective_at`
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []domain.PriceVersion{}
+	for rows.Next() {
+		var p domain.PriceVersion
+		if err := rows.Scan(&p.ID, &p.ProviderID, &p.ModelID, &p.InputPriceNano, &p.OutputPriceNano,
+			&p.CacheReadPriceNano, &p.CacheWritePriceNano, &p.Currency, &p.EffectiveAt, &p.Source); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// AggregateUsage 聚合用量与费用（MR-019）。
+// 价格用事件发生时的生效版本（相关子查询，处理版本边界）；nano-USD int64 累加，不用 float。
+func (s *Store) AggregateUsage(ctx context.Context, where string, args []any, groupBy string) ([]domain.UsageRow, error) {
+	q := `SELECT ` + groupBy + `,
+		COUNT(*) AS requests,
+		SUM(ra.input_tokens) AS input, SUM(ra.output_tokens) AS output,
+		SUM(ra.cache_read_tokens) AS cr, SUM(ra.cache_write_tokens) AS cw,
+		SUM(ra.reasoning_tokens) AS reasoning,
+		SUM(ra.input_tokens * (SELECT pv.input_price_nano FROM price_versions pv
+			WHERE pv.model_id=ra.actual_model AND pv.effective_at<=ra.occurred_at
+			ORDER BY pv.effective_at DESC LIMIT 1)) AS cost_input,
+		SUM(ra.output_tokens * (SELECT pv.output_price_nano FROM price_versions pv
+			WHERE pv.model_id=ra.actual_model AND pv.effective_at<=ra.occurred_at
+			ORDER BY pv.effective_at DESC LIMIT 1)) AS cost_output,
+		SUM(ra.cache_read_tokens * (SELECT pv.cache_read_price_nano FROM price_versions pv
+			WHERE pv.model_id=ra.actual_model AND pv.effective_at<=ra.occurred_at
+			ORDER BY pv.effective_at DESC LIMIT 1)) AS cost_cr,
+		SUM(ra.cache_write_tokens * (SELECT pv.cache_write_price_nano FROM price_versions pv
+			WHERE pv.model_id=ra.actual_model AND pv.effective_at<=ra.occurred_at
+			ORDER BY pv.effective_at DESC LIMIT 1)) AS cost_cw
+		FROM request_attempts ra WHERE ra.status='success' `
+	if where != "" {
+		q += ` AND ` + where
+	}
+	q += ` GROUP BY ` + groupBy
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []domain.UsageRow{}
+	for rows.Next() {
+		var r domain.UsageRow
+		var costInput, costOutput, costCR, costCW int64
+		if err := rows.Scan(&r.ProviderID, &r.AccountID, &r.ModelID, &r.ProjectID, &r.Requests,
+			&r.InputTokens, &r.OutputTokens, &r.CacheReadTokens, &r.CacheWriteTokens, &r.ReasoningTokens,
+			&costInput, &costOutput, &costCR, &costCW); err != nil {
+			return nil, err
+		}
+		r.CostNanoUSD = costInput + costOutput + costCR + costCW
+		r.Source = "observed"
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // -------- access_tokens --------

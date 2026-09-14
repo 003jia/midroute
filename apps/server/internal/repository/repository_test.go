@@ -216,4 +216,69 @@ func TestMarkStaleAttemptsInterrupted(t *testing.T) {
 	}
 }
 
+func TestPriceAtAndAggregateCost(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t)
+
+	// 价格版本：gpt-4o 两个版本（跨时间边界）
+	if err := store.UpsertPriceVersion(ctx, domain.PriceVersion{
+		ID: "p1", ProviderID: "oai", ModelID: "gpt-4o",
+		InputPriceNano: 2500, OutputPriceNano: 10000, // 2.5e-6 / 1e-5 USD/token
+		EffectiveAt: "2026-08-01T00:00:00Z", Source: "manual",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertPriceVersion(ctx, domain.PriceVersion{
+		ID: "p2", ProviderID: "oai", ModelID: "gpt-4o",
+		InputPriceNano: 5000, OutputPriceNano: 15000,
+		EffectiveAt: "2026-09-01T00:00:00Z", Source: "manual",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 8 月事件命中 p1，9 月事件命中 p2
+	_ = store.CreateAttempt(ctx, RequestAttempt{ID: "ra1", RequestID: "r1", AttemptID: "a1", ProviderID: "oai", AccountID: "acc1", ActualModel: "gpt-4o", OccurredAt: "2026-08-15T00:00:00Z"})
+	_ = store.FinishAttempt(ctx, RequestAttempt{RequestID: "r1", AttemptID: "a1", Status: "success", InputTokens: 1000, OutputTokens: 100, OccurredAt: "2026-08-15T00:00:00Z"})
+	_ = store.CreateAttempt(ctx, RequestAttempt{ID: "ra2", RequestID: "r2", AttemptID: "a2", ProviderID: "oai", AccountID: "acc1", ActualModel: "gpt-4o", OccurredAt: "2026-09-10T00:00:00Z"})
+	_ = store.FinishAttempt(ctx, RequestAttempt{RequestID: "r2", AttemptID: "a2", Status: "success", InputTokens: 1000, OutputTokens: 100, OccurredAt: "2026-09-10T00:00:00Z"})
+
+	rows, err := store.AggregateUsage(ctx, "", nil, "ra.provider_id, ra.account_id, ra.actual_model, ra.project_id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("rows=%d", len(rows))
+	}
+	r := rows[0]
+	// 期望成本 = 8月(1000*2500 + 100*10000) + 9月(1000*5000 + 100*15000)
+	//        = (2,500,000 + 1,000,000) + (5,000,000 + 1,500,000) = 10,000,000 nano
+	if r.CostNanoUSD != 10000000 {
+		t.Fatalf("cost=%d want 10000000", r.CostNanoUSD)
+	}
+	if r.InputTokens != 2000 || r.OutputTokens != 200 {
+		t.Fatalf("tokens in=%d out=%d", r.InputTokens, r.OutputTokens)
+	}
+	if r.Requests != 2 {
+		t.Fatalf("requests=%d", r.Requests)
+	}
+}
+
+// PriceAt 版本边界：取 <=t 的最新版本。
+func TestPriceAtVersionBoundary(t *testing.T) {
+	ctx := context.Background()
+	store := newStore(t)
+	_ = store.UpsertPriceVersion(ctx, domain.PriceVersion{ID: "p1", ModelID: "m1", InputPriceNano: 1, EffectiveAt: "2026-08-01T00:00:00Z"})
+	_ = store.UpsertPriceVersion(ctx, domain.PriceVersion{ID: "p2", ModelID: "m1", InputPriceNano: 2, EffectiveAt: "2026-09-01T00:00:00Z"})
+	p, ok, _ := store.PriceAt(ctx, "m1", "2026-08-20T00:00:00Z")
+	if !ok || p.ID != "p1" || p.InputPriceNano != 1 {
+		t.Fatalf("aug price=%+v ok=%v", p, ok)
+	}
+	p, ok, _ = store.PriceAt(ctx, "m1", "2026-09-05T00:00:00Z")
+	if !ok || p.ID != "p2" {
+		t.Fatalf("sep price=%+v ok=%v", p, ok)
+	}
+	if _, ok, _ := store.PriceAt(ctx, "m1", "2026-07-01T00:00:00Z"); ok {
+		t.Fatal("before first version should be missing")
+	}
+}
+
 func strPtr(s string) *string { return &s }

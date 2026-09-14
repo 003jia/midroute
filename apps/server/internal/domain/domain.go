@@ -156,11 +156,42 @@ type QuotaSnapshot struct {
 
 // QuotaPool 共享额度池。
 type QuotaPool struct {
-	ID          string   `json:"id"`
-	ProviderID  string   `json:"provider_id"`
-	ExternalOrg string   `json:"external_org,omitempty"`
-	Scope       string   `json:"scope"` // account | org
-	MemberIDs   []string `json:"member_ids"`
+	ID         string   `json:"id"`
+	ProviderID string   `json:"provider_id"`
+	ExternalOrg string  `json:"external_org,omitempty"`
+	Scope      string   `json:"scope"` // account | org
+	MemberIDs  []string `json:"member_ids"`
+}
+
+// PriceVersion 价格版本（MR-019）。金额用定点 nano-USD/令牌（int64），禁止 float 累加。
+type PriceVersion struct {
+	ID                string `json:"id"`
+	ProviderID        string `json:"provider_id"`
+	ModelID           string `json:"model_id"`
+	InputPriceNano    int64  `json:"input_price_nano"`
+	OutputPriceNano   int64  `json:"output_price_nano"`
+	CacheReadPriceNano  int64 `json:"cache_read_price_nano"`
+	CacheWritePriceNano int64 `json:"cache_write_price_nano"`
+	Currency          string `json:"currency"`
+	EffectiveAt       string `json:"effective_at"`
+	Source            string `json:"source"`
+}
+
+// UsageRow 聚合行。
+type UsageRow struct {
+	Bucket         string `json:"bucket,omitempty"`
+	ProviderID     string `json:"provider_id,omitempty"`
+	AccountID      string `json:"account_id,omitempty"`
+	ModelID        string `json:"model_id,omitempty"`
+	ProjectID      string `json:"project_id,omitempty"`
+	Requests       int64  `json:"requests"`
+	InputTokens    int64  `json:"input_tokens"`
+	OutputTokens   int64  `json:"output_tokens"`
+	CacheReadTokens int64 `json:"cache_read_tokens"`
+	CacheWriteTokens int64 `json:"cache_write_tokens"`
+	ReasoningTokens int64 `json:"reasoning_tokens"`
+	CostNanoUSD    int64  `json:"cost_nano_usd"` // 已按事件时价格版本结算
+	Source         string `json:"source"`        // observed（Midroute 观测）
 }
 
 // Account 平台账户。凭据仅以 SecretRef 引用形式存在。

@@ -331,9 +331,9 @@ P1 · 部分实现 · 对应 M4、US-009 · 依赖：MR-009、MR-015。
 目标：扩展 `internal/usage`、`price_versions`、统计/对账 API，接入已有官方适配器。
 实现步骤：①按小时/日/周、项目、Provider、账户、模型聚合；②使用事件发生时生效的价格版本，按厂商 Token 包含关系计算定点金额；③无价格或用量不完整返回不可估算/估算范围；④官方账单权限单独验证，同范围/币种/窗口才对账；⑤统计注明经 Midroute 观测的覆盖范围。
 
-- [ ] cache/reasoning 不重复相加，价格跨版本边界计算正确，不同币种不直接求和。
-- [ ] 官方与本地数据分列，未通过 Midroute 的消耗不伪装成本地请求。
-- [ ] 缺价格、缺字段、时间窗口错位和账单延迟有可解释结果。
+- [x] cache/reasoning 不重复相加，价格跨版本边界计算正确，不同币种不直接求和。（2026-09-14：price_versions 定点 nano-USD（v9），PriceAt 版本边界 + 聚合按事件时价格版本相关子查询结算（TestPriceAtAndAggregateCost 跨 8/9 月边界）；cache read/write、reasoning 分列不计入总量叠加）
+- [x] 官方与本地数据分列，未通过 Midroute 的消耗不伪装成本地请求。（2026-09-14：/api/v1/usage/summary 仅统计 request_attempts（Midroute 观测），scope=observed_by_midroute；官方账单走 internal/usage 对账适配器，未在本地聚合中混入）
+- [x] 缺价格、缺字段、时间窗口错位和账单延迟有可解释结果。（2026-09-14：无价格版本时成本为 0 但 Token 仍显示，界面标注 cost_estimable 提示；账单延迟/对账差异由 internal/usage.Reconcile 分列展示）
 
 ### MR-020 预算预留与费用边界
 

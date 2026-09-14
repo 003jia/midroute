@@ -215,6 +215,19 @@ CREATE INDEX idx_request_attempts_request ON request_attempts(request_id);
 CREATE INDEX idx_request_attempts_account ON request_attempts(account_id, occurred_at);
 `,
 	},
+	{
+		Version: 9,
+		Name:    "price_versions_fixed_point",
+		Up: `
+-- 价格定点化（MR-019）：nano-USD/令牌（int64），避免 float 累加误差。
+-- 旧的 REAL 列保留兼容，不再用于新计算。
+ALTER TABLE price_versions ADD COLUMN input_price_nano INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE price_versions ADD COLUMN output_price_nano INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE price_versions ADD COLUMN cache_read_price_nano INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE price_versions ADD COLUMN cache_write_price_nano INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX idx_price_versions_model_time ON price_versions(model_id, effective_at);
+`,
+	},
 }
 
 // KnownVersion 当前程序支持的最高 schema 版本。

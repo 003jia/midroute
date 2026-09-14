@@ -95,6 +95,8 @@ func (a *App) Mount(srv *httpserver.Server) {
 	srv.MountFunc("/api/v1/jobs/", a.handleJob)
 	srv.MountFunc("/api/v1/requests", a.handleRequests)
 	srv.MountFunc("/api/v1/requests/", a.handleRequestDetail)
+	srv.MountFunc("/api/v1/price-versions", a.handlePriceVersions)
+	srv.MountFunc("/api/v1/usage/summary", a.handleUsageSummary)
 	srv.MountFunc("/api/v1/oauth/", a.oauthAction)
 	// 网关（推理）API：项目令牌鉴权（httpserver 对 /v1/* 不施加管理 Guard）
 	srv.MountFunc("/v1/models", a.requireToken(a.handleGatewayModels))
@@ -726,6 +728,88 @@ func (a *App) handleRequestDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpserver.WriteJSON(w, http.StatusOK, map[string]any{"request_id": parts[3], "data": attempts})
+}
+
+// -------- 价格版本与用量汇总（MR-019）--------
+
+// handlePriceVersions GET 列表 / POST 写入。
+func (a *App) handlePriceVersions(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		model := r.URL.Query().Get("model_id")
+		list, err := a.Store.ListPriceVersions(r.Context(), model)
+		if err != nil {
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询价格失败", err))
+			return
+		}
+		httpserver.WriteJSON(w, http.StatusOK, map[string]any{"data": list})
+	case http.MethodPost:
+		var in domain.PriceVersion
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.ModelID == "" || in.EffectiveAt == "" {
+			httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "缺少 model_id 或 effective_at"))
+			return
+		}
+		if in.ID == "" {
+			in.ID = "price_" + shortID()
+		}
+		if in.Currency == "" {
+			in.Currency = "usd"
+		}
+		if in.Source == "" {
+			in.Source = "manual"
+		}
+		if err := a.Store.UpsertPriceVersion(r.Context(), in); err != nil {
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "写入价格失败", err))
+			return
+		}
+		_ = a.Store.RecordAuditEvent(r.Context(), "admin", "price.create", in.ModelID, in.EffectiveAt)
+		httpserver.WriteJSON(w, http.StatusCreated, map[string]any{"id": in.ID})
+	default:
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
+	}
+}
+
+// handleUsageSummary 用量聚合（窗口/维度过滤）。
+func (a *App) handleUsageSummary(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
+		return
+	}
+	q := r.URL.Query()
+	providerID := q.Get("provider_id")
+	accountID := q.Get("account_id")
+	modelID := q.Get("model_id")
+	projectID := q.Get("project_id")
+	where := ""
+	args := []any{}
+	if providerID != "" {
+		where += "ra.provider_id=?"
+		args = append(args, providerID)
+	}
+	if accountID != "" {
+		where += " AND ra.account_id=?"
+		args = append(args, accountID)
+	}
+	if modelID != "" {
+		where += " AND ra.actual_model=?"
+		args = append(args, modelID)
+	}
+	if projectID != "" {
+		where += " AND ra.project_id=?"
+		args = append(args, projectID)
+	}
+	where = strings.TrimPrefix(where, " AND ")
+	rows, err := a.Store.AggregateUsage(r.Context(), where, args, "ra.provider_id, ra.account_id, ra.actual_model, ra.project_id")
+	if err != nil {
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "聚合用量失败", err))
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, map[string]any{
+		"data":       rows,
+		"unit":       "nano_usd",
+		"scope":      "observed_by_midroute",
+		"disclaimer": "仅统计经 Midroute 转发的请求；金额按事件时价格版本结算，缺价格时不计费（见 cost_estimable 提示）",
+	})
 }
 
 // -------- 额度池与快照（MR-009）--------

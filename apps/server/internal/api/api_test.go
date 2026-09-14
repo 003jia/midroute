@@ -863,6 +863,60 @@ func TestAnthropicMessagesStreamingPassthrough(t *testing.T) {
 	}
 }
 
+// MR-019：价格版本写入 + 用量汇总 API。
+func TestPriceVersionsAndUsageSummary(t *testing.T) {
+	ts, app := buildServer(t)
+	base := ts.URL
+	ctx := context.Background()
+
+	// 写价格
+	resp := mustPost(t, base+"/api/v1/price-versions",
+		`{"provider_id":"oai","model_id":"gpt-4o","input_price_nano":2500,"output_price_nano":10000,"effective_at":"2026-08-01T00:00:00Z","source":"manual"}`)
+	if resp.StatusCode != 201 {
+		t.Fatalf("price create: %d", resp.StatusCode)
+	}
+
+	// 造一条成功用量（request_attempts）
+	_ = app.Store.CreateAttempt(ctx, repository.RequestAttempt{
+		ID: "ra1", RequestID: "req9", AttemptID: "a1", ProviderID: "oai", AccountID: "acc1",
+		ActualModel: "gpt-4o", OccurredAt: "2026-08-10T00:00:00Z",
+	})
+	_ = app.Store.FinishAttempt(ctx, repository.RequestAttempt{
+		RequestID: "req9", AttemptID: "a1", Status: "success", InputTokens: 1000, OutputTokens: 100,
+	})
+
+	// 用量汇总
+	resp, _ = http.Get(base + "/api/v1/usage/summary")
+	if resp.StatusCode != 200 {
+		t.Fatalf("summary: %d", resp.StatusCode)
+	}
+	var out struct {
+		Data []domain.UsageRow `json:"data"`
+	}
+	decodeBody(t, resp, &out)
+	if len(out.Data) != 1 {
+		t.Fatalf("rows=%d", len(out.Data))
+	}
+	row := out.Data[0]
+	// 1000*2500 + 100*10000 = 3,500,000 nano
+	if row.CostNanoUSD != 3500000 || row.InputTokens != 1000 || row.Requests != 1 {
+		t.Fatalf("row=%+v", row)
+	}
+	if row.Source != "observed" {
+		t.Fatalf("source=%s", row.Source)
+	}
+
+	// 价格列表
+	resp, _ = http.Get(base + "/api/v1/price-versions?model_id=gpt-4o")
+	var prices struct {
+		Data []domain.PriceVersion `json:"data"`
+	}
+	decodeBody(t, resp, &prices)
+	if len(prices.Data) != 1 || prices.Data[0].InputPriceNano != 2500 {
+		t.Fatalf("prices=%+v", prices.Data)
+	}
+}
+
 func decodeBody(t *testing.T, resp *http.Response, out any) {
 	t.Helper()
 	defer resp.Body.Close()
