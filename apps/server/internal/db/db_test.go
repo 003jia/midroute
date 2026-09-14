@@ -44,6 +44,7 @@ func TestMigrateFailureRollsBack(t *testing.T) {
 	// 注入一条必然失败的迁移，验证：报错、版本不推进、部分写入回滚（MR-003）。
 	orig := Migrations
 	defer func() { Migrations = orig }()
+	realKnown := orig[len(orig)-1].Version // 注入失败版本前捕获真实已知版本
 	Migrations = append([]Migration{}, orig...)
 	Migrations = append(Migrations, Migration{
 		Version: 99,
@@ -67,8 +68,8 @@ INSERT INTO missing_table VALUES('x');   -- 失败
 	if err == nil {
 		t.Fatal("expected migration failure")
 	}
-	if v != 3 { // 前三个版本成功
-		t.Fatalf("version=%d want 3", v)
+	if v != realKnown { // 已知版本全部成功，仅注入的失败版本被拒绝
+		t.Fatalf("version=%d want %d", v, realKnown)
 	}
 	// 失败版本未记录
 	var n int

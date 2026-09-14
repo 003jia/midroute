@@ -123,4 +123,30 @@ type Token struct {
 	Enabled    bool   `json:"enabled"`
 	CreatedAt  string `json:"created_at"`
 	LastUsedAt string `json:"last_used_at"`
+	// ProjectID 所属项目；空串为未分组的默认作用域（migration v4 兼容）。
+	ProjectID string `json:"project_id"`
+	// ModelWhitelist 模型白名单（JSON 数组字符串）；空数组表示不限制。
+	ModelWhitelist string `json:"model_whitelist"`
+	// ExpiresAt 到期时间（RFC3339）；空串表示长期有效。
+	ExpiresAt string `json:"expires_at"`
+	// MaxConcurrency 最大并发推理请求数；0 表示不限制。
+	MaxConcurrency int `json:"max_concurrency"`
+}
+
+// Project 推理项目（MR-016）：访问令牌的分组与预算载体。
+type Project struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	CreatedAt string `json:"created_at"`
+	UpdatedAt string `json:"updated_at"`
+}
+
+// ResponseBinding Responses 协议会话句柄绑定（MR-013）：
+// previous_response_id 与产生它的账户严格绑定，跨账户不可续接。
+type ResponseBinding struct {
+	ResponseID string `json:"response_id"`
+	AccountID  string `json:"account_id"`
+	ModelID    string `json:"model_id"`
+	CreatedAt  string `json:"created_at"`
+	ExpiresAt  string `json:"expires_at"`
 }

@@ -110,9 +110,49 @@ func TestFullFlowWithMockOpenAIUpstream(t *testing.T) {
 		t.Fatalf("policy: %d", resp.StatusCode)
 	}
 
-	// 6. 网关非流式
+	// 6. 创建项目令牌并校验网关鉴权边界（MR-016）
+	resp, err = http.Post(base+"/api/v1/tokens", "application/json",
+		strings.NewReader(`{"name":"推理令牌","model_whitelist":["coding-fast","gpt-4o"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tok struct {
+		Token string `json:"token"`
+	}
+	decodeBody(t, resp, &tok)
+	if resp.StatusCode != 201 || tok.Token == "" {
+		t.Fatalf("token create: %d %+v", resp.StatusCode, tok)
+	}
+
+	// 6a. 无令牌 → 401（管理员未登录也不放行推理）
 	resp, err = http.Post(base+"/v1/chat/completions", "application/json",
 		strings.NewReader(`{"model":"coding-fast","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 401 {
+		t.Fatalf("gateway without token: want 401 got %d", resp.StatusCode)
+	}
+
+	// 6b. 白名单外模型 → 403（请求上游前拒绝）
+	req403, _ := http.NewRequest(http.MethodPost, base+"/v1/chat/completions",
+		strings.NewReader(`{"model":"other-model","messages":[{"role":"user","content":"hi"}]}`))
+	req403.Header.Set("Authorization", "Bearer "+tok.Token)
+	resp, err = http.DefaultClient.Do(req403)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 403 {
+		t.Fatalf("model outside whitelist: want 403 got %d", resp.StatusCode)
+	}
+
+	// 7. 网关非流式（带令牌）
+	req7, _ := http.NewRequest(http.MethodPost, base+"/v1/chat/completions",
+		strings.NewReader(`{"model":"coding-fast","messages":[{"role":"user","content":"hi"}]}`))
+	req7.Header.Set("Authorization", "Bearer "+tok.Token)
+	resp, err = http.DefaultClient.Do(req7)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,8 +173,10 @@ func TestFullFlowWithMockOpenAIUpstream(t *testing.T) {
 		t.Fatalf("chat resp=%+v", chat)
 	}
 
-	// 7. 网关 /v1/models
-	resp, _ = http.Get(base + "/v1/models")
+	// 8. 网关 /v1/models（带令牌）
+	req8, _ := http.NewRequest(http.MethodGet, base+"/v1/models", nil)
+	req8.Header.Set("Authorization", "Bearer "+tok.Token)
+	resp, _ = http.DefaultClient.Do(req8)
 	var mlist struct {
 		Object string `json:"object"`
 		Data   []struct {
@@ -329,8 +371,20 @@ func TestGatewayStreamingPassthrough(t *testing.T) {
 	http.DefaultClient.Do(mustReq(t, http.MethodPut, base+"/api/v1/routing-policies/gpt-4o",
 		`{"name":"x","candidates":[{"account_id":"`+acc.ID+`","model_id":"gpt-4o","priority":1,"weight":1}],"enabled":true}`))
 
-	resp, err := http.Post(base+"/v1/chat/completions", "application/json",
+	// 项目令牌（网关推理面要求）
+	tokResp := mustPost(t, base+"/api/v1/tokens", `{"name":"流式令牌"}`)
+	var tok struct {
+		Token string `json:"token"`
+	}
+	decodeBody(t, tokResp, &tok)
+
+	req, err := http.NewRequest(http.MethodPost, base+"/v1/chat/completions",
 		strings.NewReader(`{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+tok.Token)
+	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -344,6 +344,28 @@ func (s *Store) RecordUsageEvent(ctx context.Context, e UsageEvent) error {
 	return err
 }
 
+// ListUsageEvents 按时间倒序列出最近 n 条用量事件（测试与统计入口）。
+func (s *Store) ListUsageEvents(ctx context.Context, limit int) ([]UsageEvent, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, request_id, account_id, model_id, input_tokens, output_tokens, cache_tokens, reasoning_tokens, status_code, latency_ms, error_class
+		FROM usage_events ORDER BY occurred_at DESC, id DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []UsageEvent{}
+	for rows.Next() {
+		var e UsageEvent
+		if err := rows.Scan(&e.ID, &e.RequestID, &e.AccountID, &e.ModelID,
+			&e.InputTokens, &e.OutputTokens, &e.CacheTokens, &e.ReasoningTokens,
+			&e.StatusCode, &e.LatencyMS, &e.ErrorClass); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // UsageEvent 用量事件（元数据）。
 type UsageEvent struct {
 	ID              string
@@ -361,22 +383,29 @@ type UsageEvent struct {
 
 // -------- access_tokens --------
 
+// tokenColumns 是令牌查询列清单（含 migration v4 作用域字段）。
+const tokenColumns = `id, name, key_prefix, enabled, created_at, last_used_at, project_id, model_whitelist, expires_at, max_concurrency`
+
 // CreateToken 写入推理令牌（只存哈希与前缀）。
 func (s *Store) CreateToken(ctx context.Context, t domain.Token) error {
 	enabled := 0
 	if t.Enabled {
 		enabled = 1
 	}
+	if t.ModelWhitelist == "" {
+		t.ModelWhitelist = "[]"
+	}
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO access_tokens(id, name, key_hash, key_prefix, enabled, created_at, last_used_at)
-		VALUES(?,?,?,?,?,?,?)`,
-		t.ID, t.Name, t.KeyHash, t.KeyPrefix, enabled, t.CreatedAt, t.LastUsedAt)
+		INSERT INTO access_tokens(id, name, key_hash, key_prefix, enabled, created_at, last_used_at, project_id, model_whitelist, expires_at, max_concurrency)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		t.ID, t.Name, t.KeyHash, t.KeyPrefix, enabled, t.CreatedAt, t.LastUsedAt,
+		t.ProjectID, t.ModelWhitelist, t.ExpiresAt, t.MaxConcurrency)
 	return err
 }
 
 // ListTokens 列出令牌（不含哈希原文）。
 func (s *Store) ListTokens(ctx context.Context) ([]domain.Token, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, key_prefix, enabled, created_at, last_used_at FROM access_tokens ORDER BY created_at`)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+tokenColumns+` FROM access_tokens ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
@@ -384,14 +413,23 @@ func (s *Store) ListTokens(ctx context.Context) ([]domain.Token, error) {
 	out := []domain.Token{}
 	for rows.Next() {
 		var t domain.Token
-		var enabled int
-		if err := rows.Scan(&t.ID, &t.Name, &t.KeyPrefix, &enabled, &t.CreatedAt, &t.LastUsedAt); err != nil {
+		if err := scanToken(rows.Scan, &t); err != nil {
 			return nil, err
 		}
-		t.Enabled = enabled == 1
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// scanToken 按列序写入令牌（Row/Rows 共用）。
+func scanToken(scan func(dest ...any) error, t *domain.Token) error {
+	var enabled int
+	if err := scan(&t.ID, &t.Name, &t.KeyPrefix, &enabled, &t.CreatedAt, &t.LastUsedAt,
+		&t.ProjectID, &t.ModelWhitelist, &t.ExpiresAt, &t.MaxConcurrency); err != nil {
+		return err
+	}
+	t.Enabled = enabled == 1
+	return nil
 }
 
 // SetTokenEnabled 启用/禁用令牌。
@@ -422,17 +460,14 @@ func (s *Store) DeleteToken(ctx context.Context, id string) error {
 	return nil
 }
 
-// FindTokenByKeyHash 按哈希查找启用的令牌。
+// FindTokenByKeyHash 按哈希查找令牌（含禁用令牌，由调用方判定可用性）。
 func (s *Store) FindTokenByKeyHash(ctx context.Context, keyHash string) (domain.Token, error) {
 	var t domain.Token
-	var enabled int
-	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, key_prefix, enabled, created_at, last_used_at FROM access_tokens WHERE key_hash=?`, keyHash).
-		Scan(&t.ID, &t.Name, &t.KeyPrefix, &enabled, &t.CreatedAt, &t.LastUsedAt)
-	if err != nil {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT `+tokenColumns+` FROM access_tokens WHERE key_hash=?`, keyHash)
+	if err := scanToken(row.Scan, &t); err != nil {
 		return domain.Token{}, err
 	}
-	t.Enabled = enabled == 1
 	return t, nil
 }
 
@@ -440,6 +475,84 @@ func (s *Store) FindTokenByKeyHash(ctx context.Context, keyHash string) (domain.
 func (s *Store) TouchToken(ctx context.Context, id string) error {
 	_, err := s.db.ExecContext(ctx, `UPDATE access_tokens SET last_used_at=? WHERE id=?`, now(), id)
 	return err
+}
+
+// -------- projects（MR-016）--------
+
+// CreateProject 插入项目。
+func (s *Store) CreateProject(ctx context.Context, p domain.Project) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO projects(id, name, created_at, updated_at) VALUES(?,?,?,?)`,
+		p.ID, p.Name, now(), now())
+	return err
+}
+
+// ListProjects 列出项目。
+func (s *Store) ListProjects(ctx context.Context) ([]domain.Project, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, created_at, updated_at FROM projects ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []domain.Project{}
+	for rows.Next() {
+		var p domain.Project
+		if err := rows.Scan(&p.ID, &p.Name, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// GetProject 获取单个项目。
+func (s *Store) GetProject(ctx context.Context, id string) (domain.Project, error) {
+	var p domain.Project
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, name, created_at, updated_at FROM projects WHERE id=?`, id).
+		Scan(&p.ID, &p.Name, &p.CreatedAt, &p.UpdatedAt)
+	return p, err
+}
+
+// DeleteProject 删除项目（引用检查由调用方完成）。
+func (s *Store) DeleteProject(ctx context.Context, id string) error {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM projects WHERE id=?`, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// -------- response_bindings（MR-013）--------
+
+// SaveResponseBinding 记录 Responses 会话句柄绑定（upsert）。
+func (s *Store) SaveResponseBinding(ctx context.Context, b domain.ResponseBinding) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO response_bindings(response_id, account_id, model_id, created_at, expires_at)
+		VALUES(?,?,?,?,?)
+		ON CONFLICT(response_id) DO UPDATE SET expires_at=excluded.expires_at`,
+		b.ResponseID, b.AccountID, b.ModelID, now(), b.ExpiresAt)
+	return err
+}
+
+// GetResponseBinding 查询绑定；已过期返回 sql.ErrNoRows（过期即不可续接）。
+func (s *Store) GetResponseBinding(ctx context.Context, responseID string) (domain.ResponseBinding, error) {
+	var b domain.ResponseBinding
+	err := s.db.QueryRowContext(ctx,
+		`SELECT response_id, account_id, model_id, created_at, expires_at FROM response_bindings WHERE response_id=?`,
+		responseID).Scan(&b.ResponseID, &b.AccountID, &b.ModelID, &b.CreatedAt, &b.ExpiresAt)
+	if err != nil {
+		return domain.ResponseBinding{}, err
+	}
+	if b.ExpiresAt != "" {
+		if exp, perr := time.Parse(time.RFC3339, b.ExpiresAt); perr == nil && time.Now().UTC().After(exp) {
+			return domain.ResponseBinding{}, sql.ErrNoRows
+		}
+	}
+	return b, nil
 }
 
 // -------- 审计 --------

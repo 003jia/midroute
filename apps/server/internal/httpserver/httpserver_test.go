@@ -57,9 +57,10 @@ func TestReadyz(t *testing.T) {
 }
 
 func TestProtectedRouteRequiresAuthWhenRemote(t *testing.T) {
-	// 用真实监听验证 RemoteAddr 判定；httptest 的 RemoteAddr 不可控，直接测 handler
+	// 用真实监听验证 RemoteAddr 判定；httptest 的 RemoteAddr 不可控，直接测 handler。
+	// 注意 /v1/* 已改为推理面（项目令牌鉴权，MR-016），Guard 只覆盖管理面路径。
 	h := newTestServer(t, true)
-	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/models", nil)
 	req.RemoteAddr = "192.168.0.5:1234"
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
@@ -77,13 +78,26 @@ func TestProtectedRouteRequiresAuthWhenRemote(t *testing.T) {
 
 func TestProtectedRouteWithValidKey(t *testing.T) {
 	h := newTestServer(t, true)
-	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/models", nil)
 	req.RemoteAddr = "192.168.0.5:1234"
 	req.Header.Set("Authorization", "Bearer test-admin-key")
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("valid key should reach route (404): got %d", w.Code)
+	}
+}
+
+// TestInferencePathBypassesGuard /v1/* 不走管理 Guard（推理面由项目令牌鉴权）。
+func TestInferencePathBypassesGuard(t *testing.T) {
+	h := newTestServer(t, true)
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.RemoteAddr = "192.168.0.5:1234" // 远程来源也不需要管理密钥
+	req.Host = "any.host"
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code == http.StatusUnauthorized || w.Code == http.StatusForbidden {
+		t.Fatalf("/v1 must not be blocked by admin guard, got %d", w.Code)
 	}
 }
 

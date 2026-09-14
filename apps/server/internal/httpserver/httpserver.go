@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"midroute/internal/errs"
@@ -90,9 +91,15 @@ func (s *Server) MountFunc(pattern string, fn http.HandlerFunc) {
 }
 
 // Handler 返回带安全边界中间件的最终 handler。
+// /v1/* 推理网关不施加管理 Guard：推理面由 api 层的项目访问令牌鉴权
+// （MR-016：管理员密钥不自动成为推理凭证）。
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/healthz" || r.URL.Path == "/readyz" {
+			s.Mux.ServeHTTP(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/v1/") {
 			s.Mux.ServeHTTP(w, r)
 			return
 		}

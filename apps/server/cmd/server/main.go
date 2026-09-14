@@ -18,6 +18,7 @@ import (
 
 	"midroute/internal/api"
 	"midroute/internal/config"
+	"midroute/internal/connectors/oauth"
 	"midroute/internal/credentials"
 	"midroute/internal/db"
 	"midroute/internal/httpserver"
@@ -73,6 +74,18 @@ func run() error {
 	app := api.NewApp(store, v, nil, log)
 	rt := router.New(store, app.ResolveForRouter, log)
 	app.Router = rt
+
+	// OAuth 服务（M3）：按平台注册；Codex 端点证据见 docs/provider-capabilities.md §2.1。
+	// 推理转发共享客户端：无整体超时（流式长连接），连接建立与空闲由传输层控制。
+	app.SetHTTPClient(&http.Client{
+		Transport: &http.Transport{
+			MaxIdleConns:        16,
+			MaxIdleConnsPerHost: 8,
+			IdleConnTimeout:     90 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
+		},
+	})
+	app.RegisterOAuth("codex", oauth.NewService(v, oauth.Codex, nil))
 
 	// HTTP 服务
 	guard := session.NewGuard(cfg.LocalOnly, cfg.AdminKey)

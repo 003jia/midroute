@@ -51,7 +51,8 @@ tasks/              PRD、实施步骤与验收清单
 
 - M0/M1 已验收（2026-09-14）：工程门禁、页面托管、安全边界（会话/CSRF/DNS rebinding 防护）、备份/冒烟/扫描脚本全部收口；MR-028 恢复入口仍未做。
 - M2 后端主体已实现：API Key Connector、模型发现、基础选路、流式/非流式中继及用量记录已有代码与 mock 测试；账户完整管理、可靠重试及真实客户端验收未完成。
-- M3 部分实现（2026-09-07）：Codex OAuth 授权码+PKCE/单飞刷新（`internal/connectors/oauth`，mock 层验证）、Codex 额度窗口被动解析（`internal/quota`）、平台能力矩阵（`docs/provider-capabilities.md`）已就绪；**真实账户授权与真实窗口数值验收待真实凭据**，OAuth 管理 API 接线待 MR-002 会话安全。
+- M3 部分实现（2026-09-14 接线）：OAuth 管理 API（start/complete/flows/revoke，本机回调监听+手动粘贴双路径）、`reauth_required` 状态与 SecretRef 旋转已接线；Codex 额度窗口被动解析（`internal/quota`）、平台能力矩阵（`docs/provider-capabilities.md`）已就绪。**真实账户授权与真实窗口数值验收待真实凭据**。
+- 推理网关（2026-09-14）：`/v1/chat/completions` + `/v1/responses`（Responses 协议原样透传、`previous_response_id` 会话句柄绑定原账户）；项目访问令牌鉴权（`internal/access`，白名单/并发/到期），与管理面会话完全分离。
 - M4–M5 部分底层代码：已有账单适配器与健康评分，未形成额度采集、统计、监测及智能路由闭环。
 - M6 前端骨架；M7 部分脚本准备。完整页面、导入恢复和发布验收待完成。
 

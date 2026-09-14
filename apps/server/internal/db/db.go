@@ -55,6 +55,36 @@ CREATE TABLE access_tokens (
 );
 `,
 	},
+	{
+		Version: 4,
+		Name:    "projects_token_scoping_and_response_bindings",
+		Up: `
+-- 项目与令牌作用域（MR-016）：项目归属、模型白名单、到期、并发上限。
+-- project_id 为空表示未分组的默认作用域，兼容 v3 存量令牌。
+ALTER TABLE access_tokens ADD COLUMN project_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE access_tokens ADD COLUMN model_whitelist TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE access_tokens ADD COLUMN expires_at TEXT NOT NULL DEFAULT '';
+ALTER TABLE access_tokens ADD COLUMN max_concurrency INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE projects (
+	id          TEXT PRIMARY KEY,
+	name        TEXT NOT NULL,
+	created_at  TEXT NOT NULL,
+	updated_at  TEXT NOT NULL
+);
+
+-- Responses 协议会话句柄绑定（MR-013）：previous_response_id 只能回到
+-- 产生它的账户，过期后拒绝而非换账户续接。
+CREATE TABLE response_bindings (
+	response_id TEXT PRIMARY KEY,
+	account_id  TEXT NOT NULL,
+	model_id    TEXT NOT NULL DEFAULT '',
+	created_at  TEXT NOT NULL,
+	expires_at  TEXT NOT NULL
+);
+CREATE INDEX idx_response_bindings_account ON response_bindings(account_id, created_at);
+`,
+	},
 }
 
 // KnownVersion 当前程序支持的最高 schema 版本。

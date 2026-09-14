@@ -53,6 +53,12 @@ func New(store *repository.Store, resolve Resolver, log *slog.Logger) *Router {
 // ErrNoCandidate 无可用候选。
 var ErrNoCandidate = errors.New("router: no usable candidate")
 
+// ResolveCandidates 导出候选解析（alias → 可用候选 + 策略 ID），
+// 供 Responses 等自带转发循环的协议层复用（MR-013）。
+func (r *Router) ResolveCandidates(ctx context.Context, alias string) ([]domain.Candidate, string, error) {
+	return r.resolveCandidates(ctx, alias)
+}
+
 // resolveCandidates 根据逻辑模型名得到候选（账户+上游模型）。
 func (r *Router) resolveCandidates(ctx context.Context, model string) ([]domain.Candidate, string, error) {
 	policy, err := r.store.GetRoutingPolicyByAlias(ctx, model)

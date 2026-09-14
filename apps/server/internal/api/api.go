@@ -8,13 +8,16 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
+	"midroute/internal/access"
 	"midroute/internal/connectors"
+	"midroute/internal/connectors/oauth"
 	"midroute/internal/credentials"
 	"midroute/internal/domain"
 	"midroute/internal/errs"
@@ -29,13 +32,33 @@ type App struct {
 	Vault  credentials.Vault
 	Router *router.Router
 	Log    *slog.Logger
-	now    func() string
+	// Access 推理令牌鉴权（MR-016）；nil 时 /v1/* 网关全部拒绝。
+	Access *access.Service
+	// OAuth 按平台名注册的 OAuth 服务（MR-007/M3 接线）。
+	OAuth map[string]*oauth.Service
+	// httpClient 推理转发使用的共享客户端（带超时/连接限制的由 main 注入）。
+	httpClient *http.Client
+	flows      *oauthFlows
+	now        func() string
 }
 
 // NewApp 创建 App。vault 由调用方注入（Keychain 或内存）。
 func NewApp(store *repository.Store, v credentials.Vault, r *router.Router, log *slog.Logger) *App {
-	return &App{Store: store, Vault: v, Router: r, Log: log, now: func() string { return time.Now().UTC().Format(time.RFC3339) }}
+	return &App{
+		Store: store, Vault: v, Router: r, Log: log,
+		Access:     access.New(store),
+		OAuth:      map[string]*oauth.Service{},
+		httpClient: &http.Client{},
+		flows:      newOAuthFlows(),
+		now:        func() string { return time.Now().UTC().Format(time.RFC3339) },
+	}
 }
+
+// SetHTTPClient 注入共享 HTTP 客户端（测试与生产各自配置）。
+func (a *App) SetHTTPClient(c *http.Client) { a.httpClient = c }
+
+// RegisterOAuth 注册一个平台的 OAuth 服务（main 装配或测试注入假端点）。
+func (a *App) RegisterOAuth(provider string, svc *oauth.Service) { a.OAuth[provider] = svc }
 
 // Mount 在基础服务上挂载管理 API 与网关 API。
 func (a *App) Mount(srv *httpserver.Server) {
@@ -47,11 +70,15 @@ func (a *App) Mount(srv *httpserver.Server) {
 	srv.MountFunc("/api/v1/models", a.handleModels)
 	srv.MountFunc("/api/v1/tokens", a.handleTokens)
 	srv.MountFunc("/api/v1/tokens/", a.tokenAction)
+	srv.MountFunc("/api/v1/projects", a.handleProjects)
+	srv.MountFunc("/api/v1/projects/", a.projectAction)
 	srv.MountFunc("/api/v1/routing-policies", a.handleRoutingPolicies)
 	srv.MountFunc("/api/v1/routing-policies/", a.handleRoutingPolicyByAlias)
-	// OpenAI-compatible 网关
-	srv.MountFunc("/v1/models", a.handleGatewayModels)
-	srv.MountFunc("/v1/chat/completions", a.handleChatCompletions)
+	srv.MountFunc("/api/v1/oauth/", a.oauthAction)
+	// 网关（推理）API：项目令牌鉴权（httpserver 对 /v1/* 不施加管理 Guard）
+	srv.MountFunc("/v1/models", a.requireToken(a.handleGatewayModels))
+	srv.MountFunc("/v1/chat/completions", a.requireToken(a.handleChatCompletions))
+	srv.MountFunc("/v1/responses", a.requireToken(a.handleResponses))
 }
 
 // ResolveForRouter 实现 router.Resolver：账户 → 可执行目标。
@@ -78,6 +105,9 @@ func defaultBaseURL(kind string) string {
 		return "https://api.anthropic.com"
 	case "gemini":
 		return "https://generativelanguage.googleapis.com"
+	case "codex":
+		// Responses 端点证据见 docs/provider-capabilities.md §2.2
+		return "https://chatgpt.com/backend-api/codex"
 	default:
 		return "https://api.openai.com"
 	}
@@ -106,7 +136,7 @@ func (a *App) handleProviders(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		switch in.Kind {
-		case "openai", "anthropic", "gemini", "openai-compatible":
+		case "openai", "anthropic", "gemini", "openai-compatible", "codex":
 		default:
 			httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "不支持的 kind: "+in.Kind))
 			return
@@ -310,6 +340,15 @@ func (a *App) accountSubAction(w http.ResponseWriter, r *http.Request, accountID
 		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询账户失败", err))
 		return
 	}
+	if action == "revoke" {
+		// 本地断开不需要解析转发目标；OAuth 账户专用
+		if acc.AuthType != string(domain.AuthOAuth) {
+			httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "revoke 仅适用于 OAuth 账户"))
+			return
+		}
+		a.revokeAccount(w, r, accountID)
+		return
+	}
 	target, err := a.resolveTarget(r.Context(), acc, "")
 	if err != nil {
 		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "解析目标失败", err))
@@ -424,22 +463,59 @@ func (a *App) handleTokens(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) createToken(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Name string `json:"name"`
+		Name           string   `json:"name"`
+		ProjectID      string   `json:"project_id"`
+		ModelWhitelist []string `json:"model_whitelist"`
+		ExpiresAt      string   `json:"expires_at"` // RFC3339，空为长期
+		MaxConcurrency int      `json:"max_concurrency"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || strings.TrimSpace(in.Name) == "" {
 		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "缺少 name"))
 		return
 	}
+	if in.ProjectID != "" {
+		if _, err := a.Store.GetProject(r.Context(), in.ProjectID); err != nil {
+			if err == sql.ErrNoRows {
+				httpserver.WriteError(w, errs.New(errs.CodeNotFound, "项目不存在"))
+				return
+			}
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询项目失败", err))
+			return
+		}
+	}
+	if in.ExpiresAt != "" {
+		if _, err := time.Parse(time.RFC3339, in.ExpiresAt); err != nil {
+			httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "expires_at 必须为 RFC3339 时间"))
+			return
+		}
+	}
+	if in.MaxConcurrency < 0 {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "max_concurrency 不能为负"))
+		return
+	}
+	whitelist := "[]"
+	if len(in.ModelWhitelist) > 0 {
+		b, err := json.Marshal(in.ModelWhitelist)
+		if err != nil {
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "序列化白名单失败", err))
+			return
+		}
+		whitelist = string(b)
+	}
 	// 生成明文令牌（仅此一次返回）；库中只存 SHA-256 与前缀
 	raw := "mrt_" + randHex(24)
 	sum := sha256.Sum256([]byte(raw))
 	t := domain.Token{
-		ID:        "tok_" + randHex(4),
-		Name:      strings.TrimSpace(in.Name),
-		KeyHash:   fmt.Sprintf("%x", sum),
-		KeyPrefix: raw[:10],
-		Enabled:   true,
-		CreatedAt: a.now(),
+		ID:             "tok_" + randHex(4),
+		Name:           strings.TrimSpace(in.Name),
+		KeyHash:        fmt.Sprintf("%x", sum),
+		KeyPrefix:      raw[:10],
+		Enabled:        true,
+		CreatedAt:      a.now(),
+		ProjectID:      in.ProjectID,
+		ModelWhitelist: whitelist,
+		ExpiresAt:      in.ExpiresAt,
+		MaxConcurrency: in.MaxConcurrency,
 	}
 	if err := a.Store.CreateToken(r.Context(), t); err != nil {
 		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "创建令牌失败", err))
@@ -448,6 +524,8 @@ func (a *App) createToken(w http.ResponseWriter, r *http.Request) {
 	_ = a.Store.RecordAuditEvent(r.Context(), "admin", "token.create", t.ID, "")
 	httpserver.WriteJSON(w, http.StatusCreated, map[string]any{
 		"id": t.ID, "name": t.Name, "key_prefix": t.KeyPrefix, "token": raw,
+		"project_id": t.ProjectID, "model_whitelist": in.ModelWhitelist,
+		"expires_at": t.ExpiresAt, "max_concurrency": t.MaxConcurrency,
 		"note": "令牌明文仅此一次显示，请妥善保存",
 	})
 }
@@ -599,6 +677,9 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "缺少 model 或 messages"))
 		return
 	}
+	if !a.checkModelAllowed(w, r, req.Model) {
+		return
+	}
 	requestID := "req_" + shortID()
 	if req.Stream {
 		a.streamChat(w, r, &req, requestID)
@@ -725,11 +806,18 @@ func (a *App) mapRelayError(err error) *errs.Error {
 
 func (a *App) logError(decision *router.Decision, err error) {
 	if a.Log != nil && err != nil {
-		a.Log.Error("relay failed", "request_id", decision.RequestID, "alias", decision.Alias, "err", err)
+		reqID := ""
+		alias := ""
+		if decision != nil {
+			reqID, alias = decision.RequestID, decision.Alias
+		}
+		a.Log.Error("relay failed", "request_id", reqID, "alias", alias, "err", err)
 	}
 }
 
 // resolveTarget 解析账户目标（含凭据解密）。
+// OAuth 账户（auth_type=oauth）：加载令牌束，按需单飞刷新；平台拒绝刷新时
+// 标记 reauth_required 并返回上游鉴权错误（MR-007 步骤④ 接线）。
 func (a *App) resolveTarget(ctx context.Context, acc domain.Account, modelID string) (*connectors.Target, error) {
 	prov, err := a.Store.GetProvider(ctx, acc.ProviderID)
 	if err != nil {
@@ -737,6 +825,9 @@ func (a *App) resolveTarget(ctx context.Context, acc domain.Account, modelID str
 	}
 	if acc.Status != "active" {
 		return nil, fmt.Errorf("账户不可用: %s", acc.Status)
+	}
+	if acc.AuthType == string(domain.AuthOAuth) {
+		return a.resolveOAuthTarget(ctx, acc, prov, modelID)
 	}
 	sec, err := a.Vault.Get(credentials.SecretRef{
 		Service: acc.SecretService, Account: acc.SecretAccount, VaultProvider: acc.VaultProvider,
@@ -753,6 +844,45 @@ func (a *App) resolveTarget(ctx context.Context, acc domain.Account, modelID str
 		ProviderKind: connectors.ProviderKind(prov.Kind),
 		BaseURL:      base,
 		APIKey:       string(sec.Value),
+		ModelID:      modelID,
+	}, nil
+}
+
+// resolveOAuthTarget OAuth 账户目标解析：读 bundle → 过期则刷新（单飞）→
+// 刷新被拒标记 reauth_required。返回的 Target.APIKey 为 access token。
+func (a *App) resolveOAuthTarget(ctx context.Context, acc domain.Account, prov domain.Provider, modelID string) (*connectors.Target, error) {
+	svc, ok := a.OAuth[prov.Kind]
+	if !ok {
+		return nil, fmt.Errorf("平台 %s 未注册 OAuth 服务", prov.Kind)
+	}
+	ref := credentials.SecretRef{
+		Service: acc.SecretService, Account: acc.SecretAccount, VaultProvider: acc.VaultProvider,
+	}
+	newRef, bundle, err := svc.Refresh(ctx, acc.ID, ref.Service, ref.Account, ref)
+	if err != nil {
+		if errors.Is(err, oauth.ErrRefreshRejected) {
+			_ = a.Store.SetAccountAuthState(context.WithoutCancel(ctx), acc.ID, string(domain.AuthStateReauthRequired))
+			return nil, fmt.Errorf("oauth 凭据已失效，需要重新授权: %w", err)
+		}
+		return nil, fmt.Errorf("oauth 凭据刷新失败: %w", err)
+	}
+	// 刷新成功且引用发生变化：原子切换账户 SecretRef
+	if newRef.Fingerprint != acc.SecretFingerprint {
+		updated := acc
+		updated.VaultProvider, updated.SecretService, updated.SecretAccount, updated.SecretFingerprint =
+			newRef.VaultProvider, newRef.Service, newRef.Account, newRef.Fingerprint
+		if uerr := a.Store.UpdateAccountSecretRef(context.WithoutCancel(ctx), acc.ID, updated); uerr != nil && a.Log != nil {
+			a.Log.Error("update secret ref failed", "account", acc.ID, "err", uerr)
+		}
+	}
+	base := prov.BaseURL
+	if base == "" {
+		base = defaultBaseURL(prov.Kind)
+	}
+	return &connectors.Target{
+		ProviderKind: connectors.ProviderKind(prov.Kind),
+		BaseURL:      base,
+		APIKey:       bundle.AccessToken,
 		ModelID:      modelID,
 	}, nil
 }

@@ -13,7 +13,7 @@ scan() {
     -not -path "$ROOT/dist/*" \
     -not -path "$ROOT/data/*" \
     -not -path "$ROOT/backups/*" \
-    -not -path "$ROOT/.mimosa/*" \
+    -not -path "*/.mimosa/*" \
     -not -path "$ROOT/node_modules/*" \
     -not -name "*.lock" \
     -not -name "package-lock.json" \
