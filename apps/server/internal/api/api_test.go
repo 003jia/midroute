@@ -333,6 +333,163 @@ func mkPolicy(id, accountID string) domain.RoutingPolicy {
 	}
 }
 
+// MR-006：账户能力矩阵 —— 每能力单独判定，monitor_only 转发受限，API Key 无订阅。
+func TestAccountCapabilities(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			io.WriteString(w, `{"object":"list","data":[{"id":"gpt-4o"}]}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer upstream.Close()
+
+	ts, _ := buildServer(t)
+	base := ts.URL
+	var prov struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, mustPost(t, base+"/api/v1/providers",
+		`{"kind":"openai","name":"OpenAI","base_url":"`+upstream.URL+`"}`), &prov)
+	var acc struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, mustPost(t, base+"/api/v1/accounts",
+		`{"provider_id":"`+prov.ID+`","name":"主","api_key":"sk-test-abcdefghijklmnopqrstuvwxyz123456"}`), &acc)
+
+	resp, _ := http.Post(base+"/api/v1/accounts/"+acc.ID+"/capabilities", "application/json", nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("capabilities: %d", resp.StatusCode)
+	}
+	var out struct {
+		Data []domain.AccountCapability `json:"data"`
+	}
+	decodeBody(t, resp, &out)
+	byName := map[domain.CapabilityName]domain.AccountCapability{}
+	for _, c := range out.Data {
+		byName[c.Capability] = c
+	}
+	// 每能力都有 status，且不伪造 supported
+	for _, want := range []domain.CapabilityName{
+		domain.CapVerifyCredential, domain.CapDiscoverModels, domain.CapForward,
+		domain.CapOAuth, domain.CapSubscription, domain.CapQuota, domain.CapRefresh, domain.CapProbeHealth,
+	} {
+		if _, ok := byName[want]; !ok {
+			t.Fatalf("缺少能力 %s", want)
+		}
+	}
+	if byName[domain.CapVerifyCredential].Status != domain.CapabilitySupported {
+		t.Fatalf("verifyCredential=%s", byName[domain.CapVerifyCredential].Status)
+	}
+	if byName[domain.CapForward].Status != domain.CapabilitySupported {
+		t.Fatalf("forward=%s", byName[domain.CapForward].Status)
+	}
+	// API Key 账户不应声称订阅/刷新支持
+	if byName[domain.CapSubscription].Status == domain.CapabilitySupported {
+		t.Fatal("subscription must not be supported for API Key openai account")
+	}
+	if byName[domain.CapRefresh].Status == domain.CapabilitySupported {
+		t.Fatal("refresh must not be supported for API Key account")
+	}
+}
+
+// MR-006：仅监测账户 forward 受限。
+func TestAccountCapabilitiesMonitorOnly(t *testing.T) {
+	ts, _ := buildServer(t)
+	base := ts.URL
+	var prov struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, mustPost(t, base+"/api/v1/providers",
+		`{"kind":"openai","name":"OpenAI","base_url":"http://127.0.0.1:1"}`), &prov)
+	var acc struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, mustPost(t, base+"/api/v1/accounts",
+		`{"provider_id":"`+prov.ID+`","name":"mon","mode":"monitor_only","api_key":"sk-test-abcdefghijklmnopqrstuvwxyz123456"}`), &acc)
+	resp, _ := http.Post(base+"/api/v1/accounts/"+acc.ID+"/capabilities", "application/json", nil)
+	var out struct {
+		Data []domain.AccountCapability `json:"data"`
+	}
+	decodeBody(t, resp, &out)
+	for _, c := range out.Data {
+		if c.Capability == domain.CapForward && c.Status != domain.CapabilityUnsupported {
+			t.Fatalf("monitor_only forward must be unsupported, got %s", c.Status)
+		}
+	}
+}
+
+// MR-004：凭据轮换 —— 新凭据验证失败保留旧凭据；成功才原子切换。
+func TestCredentialRotationKeepsOldOnFailure(t *testing.T) {
+	var mode string // "good" | "bad"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if mode == "bad" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	mode = "good"
+
+	ts, app := buildServer(t)
+	base := ts.URL
+	var prov struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, mustPost(t, base+"/api/v1/providers",
+		`{"kind":"openai","name":"OpenAI","base_url":"`+upstream.URL+`"}`), &prov)
+	var acc struct {
+		ID               string `json:"id"`
+		SecretFingerprint string `json:"secret_fingerprint"`
+	}
+	// 初始密钥
+	oldKey := "sk-test-abcdefghijklmnopqrstuvwxyz123456"
+	decodeBody(t, mustPost(t, base+"/api/v1/accounts",
+		`{"provider_id":"`+prov.ID+`","name":"主","api_key":"`+oldKey+`"}`), &acc)
+
+	// 用旧凭据验证，得到旧指纹
+	oldFp := acc.SecretFingerprint
+
+	// 失败轮换：新密钥无效（upstream 拒绝）
+	mode = "bad"
+	resp := mustPost(t, base+"/api/v1/accounts/"+acc.ID+"/credential",
+		`{"api_key":"sk-new-invalid-abcdefghijklmnopqrstuvwxyz"}`)
+	if resp.StatusCode != 401 {
+		t.Fatalf("bad rotation: want 401 got %d", resp.StatusCode)
+	}
+	// 指纹未变（旧凭据保留）
+	got, _ := app.Store.GetAccount(context.Background(), acc.ID)
+	if got.SecretFingerprint != oldFp {
+		t.Fatalf("failed rotation changed fingerprint: %s -> %s", oldFp, got.SecretFingerprint)
+	}
+
+	// 成功轮换：新密钥有效
+	mode = "good"
+	resp = mustPost(t, base+"/api/v1/accounts/"+acc.ID+"/credential",
+		`{"api_key":"sk-new-good-abcdefghijklmnopqrstuvwxyz123456"}`)
+	if resp.StatusCode != 200 {
+		t.Fatalf("good rotation: %d", resp.StatusCode)
+	}
+	var rot struct {
+		SecretFingerprint string `json:"secret_fingerprint"`
+	}
+	decodeBody(t, resp, &rot)
+	got, _ = app.Store.GetAccount(context.Background(), acc.ID)
+	if got.SecretFingerprint != rot.SecretFingerprint || got.SecretFingerprint == oldFp {
+		t.Fatalf("rotation did not switch: got %s want %s", got.SecretFingerprint, rot.SecretFingerprint)
+	}
+	// 新凭据能从 Vault 取回且可转发
+	sec, err := app.Vault.Get(credentials.SecretRef{Service: got.SecretService, Account: got.SecretAccount})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sec.Zero()
+	if string(sec.Value) != "sk-new-good-abcdefghijklmnopqrstuvwxyz123456" {
+		t.Fatalf("vault secret mismatch")
+	}
+}
+
 func decodeBody(t *testing.T, resp *http.Response, out any) {
 	t.Helper()
 	defer resp.Body.Close()

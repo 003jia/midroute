@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"midroute/internal/access"
+	"midroute/internal/accounts"
 	"midroute/internal/connectors"
 	"midroute/internal/connectors/oauth"
 	"midroute/internal/credentials"
@@ -36,6 +37,8 @@ type App struct {
 	Access *access.Service
 	// OAuth 按平台名注册的 OAuth 服务（MR-007/M3 接线）。
 	OAuth map[string]*oauth.Service
+	// Caps 账户能力检查器（MR-006）。
+	Caps *accounts.CapabilityChecker
 	// httpClient 推理转发使用的共享客户端（带超时/连接限制的由 main 注入）。
 	httpClient *http.Client
 	flows      *oauthFlows
@@ -44,7 +47,7 @@ type App struct {
 
 // NewApp 创建 App。vault 由调用方注入（Keychain 或内存）。
 func NewApp(store *repository.Store, v credentials.Vault, r *router.Router, log *slog.Logger) *App {
-	return &App{
+	app := &App{
 		Store: store, Vault: v, Router: r, Log: log,
 		Access:     access.New(store),
 		OAuth:      map[string]*oauth.Service{},
@@ -52,6 +55,10 @@ func NewApp(store *repository.Store, v credentials.Vault, r *router.Router, log 
 		flows:      newOAuthFlows(),
 		now:        func() string { return time.Now().UTC().Format(time.RFC3339) },
 	}
+	app.Caps = accounts.New(store, func(ctx context.Context, acc domain.Account) (*connectors.Target, error) {
+		return app.resolveTarget(ctx, acc, "")
+	})
+	return app
 }
 
 // SetHTTPClient 注入共享 HTTP 客户端（测试与生产各自配置）。
@@ -245,6 +252,17 @@ func (a *App) accountAction(w http.ResponseWriter, r *http.Request) {
 	case len(parts) == 4:
 		// [api v1 accounts <id>]
 		switch r.Method {
+		case http.MethodGet:
+			acc, err := a.Store.GetAccount(r.Context(), parts[3])
+			if err != nil {
+				if err == sql.ErrNoRows {
+					httpserver.WriteError(w, errs.New(errs.CodeNotFound, "账户不存在"))
+					return
+				}
+				httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询账户失败", err))
+				return
+			}
+			httpserver.WriteJSON(w, http.StatusOK, acc)
 		case http.MethodPatch, http.MethodPut:
 			a.updateAccount(w, r, parts[3])
 		case http.MethodDelete:
@@ -349,6 +367,28 @@ func (a *App) accountSubAction(w http.ResponseWriter, r *http.Request, accountID
 		a.revokeAccount(w, r, accountID)
 		return
 	}
+	// capabilities / credential 不需要在线目标（credential 内部用新凭据自行解析）
+	switch action {
+	case "capabilities":
+		caps, err := a.Caps.Check(r.Context(), acc)
+		if err != nil {
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "能力检查失败", err))
+			return
+		}
+		httpserver.WriteJSON(w, http.StatusOK, map[string]any{"data": caps})
+		return
+	case "credential":
+		if r.Method != http.MethodPost {
+			httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "请用 POST"))
+			return
+		}
+		a.rotateCredential(w, r, accountID, acc)
+		return
+	case "verify", "discover":
+	default:
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "不支持的动作: "+action))
+		return
+	}
 	target, err := a.resolveTarget(r.Context(), acc, "")
 	if err != nil {
 		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "解析目标失败", err))
@@ -387,9 +427,74 @@ func (a *App) accountSubAction(w http.ResponseWriter, r *http.Request, accountID
 			return
 		}
 		httpserver.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "count": len(infos)})
-	default:
-		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "不支持的动作: "+action))
 	}
+}
+
+// rotateCredential 凭据轮换（MR-004）：先存新 SecretRef，验证通过后再原子切换；
+// 验证失败保留旧凭据，绝不覆盖。
+func (a *App) rotateCredential(w http.ResponseWriter, r *http.Request, accountID string, acc domain.Account) {
+	var in struct {
+		APIKey string `json:"api_key"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || strings.TrimSpace(in.APIKey) == "" {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "缺少 api_key"))
+		return
+	}
+	prov, err := a.Store.GetProvider(r.Context(), acc.ProviderID)
+	if err != nil {
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询 Provider 失败", err))
+		return
+	}
+	// 1) 新密钥先入 Vault，取得新 SecretRef
+	service := "account-" + acc.ProviderID
+	newRef, err := a.Vault.Store(service, accountID+"-rot", []byte(strings.TrimSpace(in.APIKey)))
+	if err != nil {
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "凭据入库失败", err))
+		return
+	}
+	// 2) 用新凭据解析目标并验证
+	target, err := a.resolveTargetFromRef(r.Context(), prov, newRef)
+	if err != nil {
+		_ = a.Vault.Delete(newRef)
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "解析新凭据失败", err))
+		return
+	}
+	conn := connectors.NewConnector(target.ProviderKind, connectors.Options{})
+	if err := conn.ValidateCredential(r.Context(), *target); err != nil {
+		_ = a.Vault.Delete(newRef) // 验证失败：删除新引用，保留旧凭据
+		_ = a.Store.RecordAuditEvent(r.Context(), "admin", "account.credential.rotate.failed", accountID, "")
+		httpserver.WriteError(w, errs.Wrap(errs.CodeUpstreamAuth, "新凭据验证失败，已保留原凭据", err))
+		return
+	}
+	// 3) 验证成功：原子切换 SecretRef
+	if err := a.Store.SetAccountCredentialRef(r.Context(), accountID, newRef.VaultProvider, newRef.Service, newRef.Account, newRef.Fingerprint); err != nil {
+		_ = a.Vault.Delete(newRef)
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "切换凭据失败", err))
+		return
+	}
+	at := a.now()
+	_ = a.Store.SetAccountStatus(r.Context(), accountID, "active")
+	_ = a.Store.SetAccountVerifiedAt(r.Context(), accountID, at)
+	_ = a.Store.RecordAuditEvent(r.Context(), "admin", "account.credential.rotate", accountID, "")
+	httpserver.WriteJSON(w, http.StatusOK, map[string]any{"ok": true, "secret_fingerprint": newRef.Fingerprint, "verified_at": at})
+}
+
+// resolveTargetFromRef 使用指定 SecretRef 解析目标（凭据轮换用）。
+func (a *App) resolveTargetFromRef(ctx context.Context, prov domain.Provider, ref credentials.SecretRef) (*connectors.Target, error) {
+	sec, err := a.Vault.Get(ref)
+	if err != nil {
+		return nil, err
+	}
+	defer sec.Zero()
+	base := prov.BaseURL
+	if base == "" {
+		base = defaultBaseURL(prov.Kind)
+	}
+	return &connectors.Target{
+		ProviderKind: connectors.ProviderKind(prov.Kind),
+		BaseURL:      base,
+		APIKey:       string(sec.Value),
+	}, nil
 }
 
 // -------- providers 生命周期（MR-004）--------
@@ -403,6 +508,17 @@ func (a *App) providerAction(w http.ResponseWriter, r *http.Request) {
 	}
 	id := parts[3]
 	switch r.Method {
+	case http.MethodGet:
+		p, err := a.Store.GetProvider(r.Context(), id)
+		if err != nil {
+			if err == sql.ErrNoRows {
+				httpserver.WriteError(w, errs.New(errs.CodeNotFound, "Provider 不存在"))
+				return
+			}
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询 Provider 失败", err))
+			return
+		}
+		httpserver.WriteJSON(w, http.StatusOK, p)
 	case http.MethodPatch, http.MethodPut:
 		var in struct {
 			Name    *string `json:"name,omitempty"`

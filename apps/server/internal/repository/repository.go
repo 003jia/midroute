@@ -156,6 +156,22 @@ func (s *Store) SetAccountVerifiedAt(ctx context.Context, id, at string) error {
 	return err
 }
 
+// SetAccountCredentialRef 原子切换账户的 SecretRef（凭据轮换；MR-004）。
+func (s *Store) SetAccountCredentialRef(ctx context.Context, id, vaultProvider, service, account, fingerprint string) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE accounts
+		SET vault_provider=?, secret_service=?, secret_account=?, secret_fingerprint=?, updated_at=?
+		WHERE id=?`,
+		vaultProvider, service, account, fingerprint, now(), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // SetAccountName 更新账户名称。
 func (s *Store) SetAccountName(ctx context.Context, id, name string) error {
 	res, err := s.db.ExecContext(ctx, `UPDATE accounts SET name=?, updated_at=? WHERE id=?`, name, now(), id)
@@ -379,6 +395,55 @@ type UsageEvent struct {
 	StatusCode      int
 	LatencyMS       int64
 	ErrorClass      string
+}
+
+// -------- account_capabilities --------
+
+// SaveAccountCapabilities 批量 upsert 账户能力矩阵。
+func (s *Store) SaveAccountCapabilities(ctx context.Context, accountID string, caps []domain.AccountCapability) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, c := range caps {
+		if c.AccountID == "" {
+			c.AccountID = accountID
+		}
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO account_capabilities(account_id, capability, status, reason, connector_version, checked_at, updated_at)
+			VALUES(?,?,?,?,?,?,?)
+			ON CONFLICT(account_id, capability) DO UPDATE SET
+				status=excluded.status,
+				reason=excluded.reason,
+				connector_version=excluded.connector_version,
+				checked_at=excluded.checked_at,
+				updated_at=excluded.updated_at`,
+			c.AccountID, string(c.Capability), string(c.Status), c.Reason, c.ConnectorVersion, c.CheckedAt, now()); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ListAccountCapabilities 读取账户能力矩阵。
+func (s *Store) ListAccountCapabilities(ctx context.Context, accountID string) ([]domain.AccountCapability, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT account_id, capability, status, reason, connector_version, checked_at
+		FROM account_capabilities WHERE account_id=? ORDER BY capability`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []domain.AccountCapability{}
+	for rows.Next() {
+		var c domain.AccountCapability
+		if err := rows.Scan(&c.AccountID, (*string)(&c.Capability), (*string)(&c.Status), &c.Reason, &c.ConnectorVersion, &c.CheckedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 // -------- access_tokens --------

@@ -85,6 +85,24 @@ CREATE TABLE response_bindings (
 CREATE INDEX idx_response_bindings_account ON response_bindings(account_id, created_at);
 `,
 	},
+	{
+		Version: 5,
+		Name:    "account_capabilities",
+		Up: `
+-- 账户能力矩阵（MR-006）：每账户每能力的状态、原因、连接器版本与检查时间。
+-- 平台声明支持 ≠ 当前凭据权限足够；不保存原始认证响应。
+CREATE TABLE account_capabilities (
+	account_id       TEXT NOT NULL REFERENCES accounts(id),
+	capability       TEXT NOT NULL,
+	status           TEXT NOT NULL,
+	reason           TEXT NOT NULL DEFAULT '',
+	connector_version TEXT NOT NULL DEFAULT '',
+	checked_at       TEXT NOT NULL,
+	updated_at       TEXT NOT NULL,
+	PRIMARY KEY (account_id, capability)
+);
+`,
+	},
 }
 
 // KnownVersion 当前程序支持的最高 schema 版本。

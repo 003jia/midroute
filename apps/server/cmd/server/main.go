@@ -86,6 +86,7 @@ func run() error {
 		},
 	})
 	app.RegisterOAuth("codex", oauth.NewService(v, oauth.Codex, nil))
+	app.Caps.RegisterOAuthProvider("codex")
 
 	// HTTP 服务
 	guard := session.NewGuard(cfg.LocalOnly, cfg.AdminKey)

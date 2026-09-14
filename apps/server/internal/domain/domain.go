@@ -50,15 +50,43 @@ const (
 	AuthStateUnknown        AuthState = "unknown"
 )
 
-// CapabilityStatus 能力三态（合约 v1 §capability）。
+// CapabilityStatus 能力状态（合约 v1 §capability）。
 // 平台声明支持 ≠ 当前凭据权限足够，二者分列保存。
+// 注意：P0-1 扩展为五态 + error/unknown，不再只有三态。
 type CapabilityStatus string
 
 const (
-	CapabilitySupported   CapabilityStatus = "supported"
-	CapabilityUnsupported CapabilityStatus = "unsupported"
-	CapabilityUnknown     CapabilityStatus = "unknown"
+	CapabilitySupported           CapabilityStatus = "supported"
+	CapabilityUnsupported         CapabilityStatus = "unsupported"
+	CapabilityPermissionRequired  CapabilityStatus = "permission_required"
+	CapabilityReauthRequired      CapabilityStatus = "reauth_required"
+	CapabilityError               CapabilityStatus = "error"
+	CapabilityUnknown             CapabilityStatus = "unknown"
 )
+
+// CapabilityName 能力名称（账户能力矩阵）。
+type CapabilityName string
+
+const (
+	CapVerifyCredential CapabilityName = "verifyCredential"
+	CapDiscoverModels   CapabilityName = "discoverModels"
+	CapForward          CapabilityName = "forward"
+	CapOAuth            CapabilityName = "oauth"
+	CapSubscription     CapabilityName = "subscription"
+	CapQuota            CapabilityName = "quota"
+	CapRefresh          CapabilityName = "refresh"
+	CapProbeHealth      CapabilityName = "probeHealth"
+)
+
+// AccountCapability 账户单项能力结果（不保存原始认证响应）。
+type AccountCapability struct {
+	AccountID        string          `json:"account_id"`
+	Capability       CapabilityName  `json:"capability"`
+	Status           CapabilityStatus `json:"status"`
+	Reason           string          `json:"reason,omitempty"`
+	ConnectorVersion string          `json:"connector_version"`
+	CheckedAt        string          `json:"checked_at"`
+}
 
 // Account 平台账户。凭据仅以 SecretRef 引用形式存在。
 type Account struct {
