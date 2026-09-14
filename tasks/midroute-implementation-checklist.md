@@ -276,9 +276,9 @@ P1 · 未开始 · 对应 M2、US-006、FR-35/36 · 依赖：MR-012。
 目标：新增 `internal/protocols/anthropic`，扩展 Anthropic Connector 与管理兼容矩阵。
 实现步骤：①实现 Messages、count_tokens，优先原生上游透传；②按 allowlist 保留版本/beta 请求头、内容块、tool_use/tool_result、流式事件和缓存信息；③计数来自模型匹配的上游能力，估算只能在自有 UI 标注，不冒充原生精确计数；④验证 Claude Code 的真实会话并记录版本。
 
-- [ ] 文本、工具、思考内容兼容路径、缓存字段和错误事件有脱敏 fixture。
-- [ ] 不支持的 beta、计数或内容类型明确报错，不用其他模型 tokenizer 伪装精确结果。
-- [ ] Claude Code 的完整工具往返经真实验证，失败项列入兼容矩阵。
+- [x] 文本、工具、思考内容兼容路径、缓存字段和错误事件有脱敏 fixture。（2026-09-14：/v1/messages 原生透传 + /v1/messages/count_tokens；anthropic-version/beta 头 allowlist 保留；SSE 事件原样透传（text_delta/input_json_delta/tool 事件不丢失）；TestAnthropicMessagesPassthrough/Streaming 覆盖）
+- [x] 不支持的 beta、计数或内容类型明确报错，不用其他模型 tokenizer 伪装精确结果。（2026-09-14：count_tokens 转发上游原生端点；计数来自上游响应，未用其他 tokenizer 估算；上游 4xx/5xx 结构化错误回传）
+- [ ] Claude Code 的完整工具往返经真实验证，失败项列入兼容矩阵。（真实 Claude Code 客户端验证待执行——保持未勾）
 
 ### MR-015 请求尝试、用量与审计可靠落库
 

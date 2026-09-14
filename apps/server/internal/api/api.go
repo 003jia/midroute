@@ -100,6 +100,8 @@ func (a *App) Mount(srv *httpserver.Server) {
 	srv.MountFunc("/v1/models", a.requireToken(a.handleGatewayModels))
 	srv.MountFunc("/v1/chat/completions", a.requireToken(a.handleChatCompletions))
 	srv.MountFunc("/v1/responses", a.requireToken(a.handleResponses))
+	srv.MountFunc("/v1/messages", a.requireToken(a.handleAnthropicMessages))
+	srv.MountFunc("/v1/messages/count_tokens", a.requireToken(a.handleAnthropicCountTokens))
 }
 
 // runDiscover 执行账户模型发现并落库（调度任务用；错误由调用方处理）。

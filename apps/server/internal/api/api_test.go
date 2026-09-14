@@ -736,6 +736,133 @@ func TestRequestAttemptsRecorded(t *testing.T) {
 	}
 }
 
+// MR-014：/v1/messages 原生透传 + 头保留 + count_tokens。
+func TestAnthropicMessagesPassthrough(t *testing.T) {
+	var gotVersion, gotBeta, gotBody string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/messages":
+			gotVersion = r.Header.Get("anthropic-version")
+			gotBeta = r.Header.Get("anthropic-beta")
+			b, _ := io.ReadAll(r.Body)
+			gotBody = string(b)
+			w.Header().Set("content-type", "application/json")
+			io.WriteString(w, `{"id":"msg_1","type":"message","model":"claude-x","content":[{"type":"text","text":"透传回答"}],"stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":2,"cache_read_input_tokens":1,"cache_creation_input_tokens":0}}`)
+		case "/v1/messages/count_tokens":
+			io.WriteString(w, `{"input_tokens":7}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	ts, _ := buildServer(t)
+	base := ts.URL
+	var prov struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, mustPost(t, base+"/api/v1/providers",
+		`{"kind":"anthropic","name":"claude","base_url":"`+upstream.URL+`"}`), &prov)
+	var acc struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, mustPost(t, base+"/api/v1/accounts",
+		`{"provider_id":"`+prov.ID+`","api_key":"sk-ant-api03-test-abcdefghijklmnopqrstuvwxyz"}`), &acc)
+	// 账户可用模型（静态目录）+ 策略
+	http.DefaultClient.Do(mustReq(t, http.MethodPut, base+"/api/v1/routing-policies/claude-sonnet-4-20250514",
+		`{"name":"c","candidates":[{"account_id":"`+acc.ID+`","model_id":"claude-sonnet-4-20250514","priority":1,"weight":1}],"enabled":true}`))
+
+	// 创建推理令牌
+	var tok struct {
+		Token string `json:"token"`
+	}
+	decodeBody(t, mustPost(t, base+"/api/v1/tokens", `{"name":"t"}`), &tok)
+
+	// /v1/messages 非流式
+	req := mustReq(t, http.MethodPost, base+"/v1/messages",
+		`{"model":"claude-sonnet-4-20250514","max_tokens":10,"messages":[{"role":"user","content":"你好"}]}`)
+	req.Header.Set("Authorization", "Bearer "+tok.Token)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("anthropic-beta", "computer-use-2025-01-24")
+	resp, _ := http.DefaultClient.Do(req)
+	if resp.StatusCode != 200 {
+		t.Fatalf("messages: %d", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "透传回答") {
+		t.Fatalf("body=%s", body)
+	}
+	// 头保留
+	if gotVersion != "2023-06-01" || gotBeta != "computer-use-2025-01-24" {
+		t.Fatalf("headers version=%q beta=%q", gotVersion, gotBeta)
+	}
+	// 模型被改写为目标模型（字段原样保留）
+	if !strings.Contains(gotBody, `"model":"claude-sonnet-4-20250514"`) || !strings.Contains(gotBody, "你好") {
+		t.Fatalf("body rewritten wrong: %s", gotBody)
+	}
+
+	// count_tokens
+	req = mustReq(t, http.MethodPost, base+"/v1/messages/count_tokens",
+		`{"model":"claude-sonnet-4-20250514","messages":[{"role":"user","content":"hi"}]}`)
+	req.Header.Set("Authorization", "Bearer "+tok.Token)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	resp, _ = http.DefaultClient.Do(req)
+	if resp.StatusCode != 200 {
+		t.Fatalf("count_tokens: %d", resp.StatusCode)
+	}
+	ct, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(ct), `"input_tokens":7`) {
+		t.Fatalf("count_tokens body=%s", ct)
+	}
+}
+
+// MR-014：流式 SSE 事件原样透传（不丢失 tool_use/input_json_delta 等事件）。
+func TestAnthropicMessagesStreamingPassthrough(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/event-stream")
+		io.WriteString(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n")
+		io.WriteString(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"你\"}}\n\n")
+		io.WriteString(w, "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"tool\\\":\\\"x\\\"}\"}}\n\n")
+		io.WriteString(w, "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n")
+		io.WriteString(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer upstream.Close()
+
+	ts, _ := buildServer(t)
+	base := ts.URL
+	var prov struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, mustPost(t, base+"/api/v1/providers",
+		`{"kind":"anthropic","name":"claude","base_url":"`+upstream.URL+`"}`), &prov)
+	var acc struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, mustPost(t, base+"/api/v1/accounts",
+		`{"provider_id":"`+prov.ID+`","api_key":"sk-ant-api03-test-abcdefghijklmnopqrstuvwxyz"}`), &acc)
+	http.DefaultClient.Do(mustReq(t, http.MethodPut, base+"/api/v1/routing-policies/claude-x",
+		`{"name":"c","candidates":[{"account_id":"`+acc.ID+`","model_id":"claude-x","priority":1,"weight":1}],"enabled":true}`))
+	var tok struct {
+		Token string `json:"token"`
+	}
+	decodeBody(t, mustPost(t, base+"/api/v1/tokens", `{"name":"t"}`), &tok)
+
+	req := mustReq(t, http.MethodPost, base+"/v1/messages",
+		`{"model":"claude-x","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	req.Header.Set("Authorization", "Bearer "+tok.Token)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	resp, _ := http.DefaultClient.Do(req)
+	if resp.StatusCode != 200 {
+		t.Fatalf("stream: %d", resp.StatusCode)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	s := string(raw)
+	// tool 事件不被丢弃（input_json_delta 保留），text 事件保留
+	if !strings.Contains(s, "input_json_delta") || !strings.Contains(s, "partial_json") || !strings.Contains(s, "text_delta") || !strings.Contains(s, "message_stop") {
+		t.Fatalf("stream events dropped: %s", s)
+	}
+}
+
 func decodeBody(t *testing.T, resp *http.Response, out any) {
 	t.Helper()
 	defer resp.Body.Close()
