@@ -88,6 +88,23 @@ func run() error {
 	app.RegisterOAuth("codex", oauth.NewService(v, oauth.Codex, nil))
 	app.Caps.RegisterOAuthProvider("codex")
 
+	// 后台刷新任务（MR-010）：models / capabilities 为可在本地触发的刷新能力。
+	app.Sched.Register("models", func(ctx context.Context, accountID string) error {
+		acc, err := store.GetAccount(ctx, accountID)
+		if err != nil {
+			return err
+		}
+		return app.RunDiscover(ctx, acc)
+	})
+	app.Sched.Register("capabilities", func(ctx context.Context, accountID string) error {
+		acc, err := store.GetAccount(ctx, accountID)
+		if err != nil {
+			return err
+		}
+		_, err = app.Caps.Check(ctx, acc)
+		return err
+	})
+
 	// HTTP 服务
 	guard := session.NewGuard(cfg.LocalOnly, cfg.AdminKey)
 	srv := httpserver.New(log, httpserver.NewDBStore(version), guard)

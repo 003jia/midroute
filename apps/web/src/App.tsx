@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { Link, Route, Routes } from 'react-router-dom'
 import AccountsPage from './pages/Accounts'
 import ModelsPage from './pages/Models'
+import QuotaPage from './pages/Quota'
 
 type Health = { ok: boolean; service: string; schema_version: number } | null
 
@@ -26,6 +27,7 @@ export default function App() {
         <Link to="/">总览</Link>
         <Link to="/accounts">账户</Link>
         <Link to="/models">模型</Link>
+        <Link to="/quota">套餐/额度</Link>
       </nav>
       <main>
         <Routes>
@@ -48,6 +50,7 @@ export default function App() {
           />
           <Route path="/accounts" element={<AccountsPage />} />
           <Route path="/models" element={<ModelsPage />} />
+          <Route path="/quota" element={<QuotaPage />} />
         </Routes>
       </main>
     </div>

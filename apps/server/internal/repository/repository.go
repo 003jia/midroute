@@ -446,6 +446,303 @@ func (s *Store) ListAccountCapabilities(ctx context.Context, accountID string) (
 	return out, rows.Err()
 }
 
+// -------- quota pools & snapshots（MR-009）--------
+
+// SaveQuotaPool 保存额度池及成员（事务）。
+func (s *Store) SaveQuotaPool(ctx context.Context, p domain.QuotaPool) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO quota_pools(id, provider_id, external_org, scope, created_at, updated_at)
+		VALUES(?,?,?,?,?,?)
+		ON CONFLICT(id) DO UPDATE SET external_org=excluded.external_org, scope=excluded.scope, updated_at=excluded.updated_at`,
+		p.ID, p.ProviderID, p.ExternalOrg, p.Scope, now(), now()); err != nil {
+		return err
+	}
+	for _, acc := range p.MemberIDs {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO quota_pool_members(pool_id, account_id, model_scope) VALUES(?,?,'*')
+			ON CONFLICT(pool_id, account_id) DO NOTHING`, p.ID, acc); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ListQuotaPools 列出池及其成员。
+func (s *Store) ListQuotaPools(ctx context.Context) ([]domain.QuotaPool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, provider_id, external_org, scope FROM quota_pools ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []domain.QuotaPool{}
+	for rows.Next() {
+		var p domain.QuotaPool
+		if err := rows.Scan(&p.ID, &p.ProviderID, &p.ExternalOrg, &p.Scope); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	// 成员
+	for i := range out {
+		mrows, err := s.db.QueryContext(ctx, `SELECT account_id FROM quota_pool_members WHERE pool_id=?`, out[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		defer mrows.Close()
+		for mrows.Next() {
+			var a string
+			if err := mrows.Scan(&a); err != nil {
+				return nil, err
+			}
+			out[i].MemberIDs = append(out[i].MemberIDs, a)
+		}
+	}
+	return out, rows.Err()
+}
+
+// GetQuotaPool 读取单个池。
+func (s *Store) GetQuotaPool(ctx context.Context, id string) (domain.QuotaPool, error) {
+	pools, err := s.ListQuotaPools(ctx)
+	if err != nil {
+		return domain.QuotaPool{}, err
+	}
+	for _, p := range pools {
+		if p.ID == id {
+			return p, nil
+		}
+	}
+	return domain.QuotaPool{}, sql.ErrNoRows
+}
+
+// SaveQuotaSnapshot 写入一条快照（幂等：同 account+window+source+时间去重按 ID）。
+func (s *Store) SaveQuotaSnapshot(ctx context.Context, snap domain.QuotaSnapshot) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO quota_snapshots(id, account_id, pool_id, window_type, limit_value, used, remaining,
+			reset_at, source, source_ref, confidence, freshness, unit, connector_version, operator, manual_expires_at, taken_at, last_success_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(id) DO UPDATE SET
+			limit_value=excluded.limit_value, used=excluded.used, remaining=excluded.remaining,
+			reset_at=excluded.reset_at, source=excluded.source, source_ref=excluded.source_ref,
+			confidence=excluded.confidence, freshness=excluded.freshness,
+			connector_version=excluded.connector_version, taken_at=excluded.taken_at, last_success_at=excluded.last_success_at`,
+		snap.ID, snap.AccountID, snap.PoolID, string(snap.WindowType),
+		nilFloat(snap.Limit), nilFloat(snap.Used), nilFloat(snap.Remaining),
+		nilStr(snap.ResetAt), string(snap.Source), snap.SourceRef, string(snap.Confidence),
+		string(snap.Freshness), snap.Unit, snap.ConnectorVersion, snap.Operator,
+		strOrEmpty(snap.ManualExpiresAt), snap.TakenAt, snap.LastSuccessAt)
+	return err
+}
+
+// ListQuotaSnapshots 按账户读取快照（可选池过滤）。
+func (s *Store) ListQuotaSnapshots(ctx context.Context, accountID string) ([]domain.QuotaSnapshot, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, account_id, pool_id, window_type, limit_value, used, remaining, reset_at,
+			source, source_ref, confidence, freshness, unit, connector_version, operator, manual_expires_at, taken_at, last_success_at
+		FROM quota_snapshots WHERE account_id=? ORDER BY taken_at DESC, window_type`, accountID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanQuotaSnapshots(rows)
+}
+
+// ListPoolSnapshots 按池读取快照（去重后）。
+func (s *Store) ListPoolSnapshots(ctx context.Context, poolID string) ([]domain.QuotaSnapshot, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, account_id, pool_id, window_type, limit_value, used, remaining, reset_at,
+			source, source_ref, confidence, freshness, unit, connector_version, operator, manual_expires_at, taken_at, last_success_at
+		FROM quota_snapshots WHERE pool_id=? ORDER BY taken_at DESC, window_type`, poolID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanQuotaSnapshots(rows)
+}
+
+// LatestQuotaSnapshot 最新一条成功观测（用于“失败保留上次成功值”）。
+func (s *Store) LatestQuotaSnapshot(ctx context.Context, accountID, windowType string) (domain.QuotaSnapshot, bool, error) {
+	var snap domain.QuotaSnapshot
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, account_id, pool_id, window_type, limit_value, used, remaining, reset_at,
+			source, source_ref, confidence, freshness, unit, connector_version, operator, manual_expires_at, taken_at, last_success_at
+		FROM quota_snapshots
+		WHERE account_id=? AND window_type=? AND source<>'manual'
+		ORDER BY taken_at DESC LIMIT 1`,
+		accountID, windowType).
+		Scan(&snap.ID, &snap.AccountID, &snap.PoolID, (*string)(&snap.WindowType), nilFloatP(&snap.Limit), nilFloatP(&snap.Used), nilFloatP(&snap.Remaining),
+			nilStrP(&snap.ResetAt), (*string)(&snap.Source), &snap.SourceRef, (*string)(&snap.Confidence),
+			(*string)(&snap.Freshness), &snap.Unit, &snap.ConnectorVersion, &snap.Operator, nilStrP(&snap.ManualExpiresAt),
+			&snap.TakenAt, &snap.LastSuccessAt)
+	if err == sql.ErrNoRows {
+		return domain.QuotaSnapshot{}, false, nil
+	}
+	if err != nil {
+		return domain.QuotaSnapshot{}, false, err
+	}
+	return snap, true, nil
+}
+
+func scanQuotaSnapshots(rows *sql.Rows) ([]domain.QuotaSnapshot, error) {
+	out := []domain.QuotaSnapshot{}
+	for rows.Next() {
+		var snap domain.QuotaSnapshot
+		if err := rows.Scan(&snap.ID, &snap.AccountID, &snap.PoolID, (*string)(&snap.WindowType),
+			nilFloatP(&snap.Limit), nilFloatP(&snap.Used), nilFloatP(&snap.Remaining),
+			nilStrP(&snap.ResetAt), (*string)(&snap.Source), &snap.SourceRef, (*string)(&snap.Confidence),
+			(*string)(&snap.Freshness), &snap.Unit, &snap.ConnectorVersion, &snap.Operator,
+			nilStrP(&snap.ManualExpiresAt), &snap.TakenAt, &snap.LastSuccessAt); err != nil {
+			return nil, err
+		}
+		out = append(out, snap)
+	}
+	return out, rows.Err()
+}
+
+// nilFloat / nilStr 供写入用（SQLite NULL）。
+func nilFloat(v *float64) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+func nilStr(v *string) any {
+	if v == nil {
+		return nil
+	}
+	return *v
+}
+
+// strOrEmpty NOT NULL 文本列的空值占位。
+func strOrEmpty(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
+}
+
+// nilFloatP / nilStrP 供扫描用（NULL → nil 指针）。
+func nilFloatP(v **float64) any { return v }
+func nilStrP(v **string) any    { return v }
+
+// CountQuotaSnapshotsByAccount 统计账户额度快照数（删除引用检查）。
+func (s *Store) CountQuotaSnapshotsByAccount(ctx context.Context, accountID string) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM quota_snapshots WHERE account_id=?`, accountID).Scan(&n)
+	return n, err
+}
+
+// -------- refresh_jobs（MR-010）--------
+
+// RefreshJob 后台刷新任务状态。
+type RefreshJob struct {
+	ID            string `json:"id"`
+	AccountID     string `json:"account_id"`
+	Capability    string `json:"capability"`
+	State         string `json:"state"` // pending|running|success|failed|interrupted
+	StartedAt     string `json:"started_at"`
+	FinishedAt    string `json:"finished_at"`
+	NextRunAt     string `json:"next_run_at"`
+	LastSuccessAt string `json:"last_success_at"`
+	RetryCount    int    `json:"retry_count"`
+	LastErrorCode string `json:"last_error_code"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedAt     string `json:"updated_at"`
+}
+
+// UpsertRefreshJob 创建或重置任务（按 account+capability 去重）。
+func (s *Store) UpsertRefreshJob(ctx context.Context, j RefreshJob) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO refresh_jobs(id, account_id, capability, state, started_at, finished_at, next_run_at, last_success_at, retry_count, last_error_code, created_at, updated_at)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(account_id, capability) DO UPDATE SET
+			id=excluded.id, state=excluded.state, started_at=excluded.started_at,
+			finished_at=excluded.finished_at, next_run_at=excluded.next_run_at,
+			last_success_at=excluded.last_success_at, retry_count=excluded.retry_count,
+			last_error_code=excluded.last_error_code, updated_at=excluded.updated_at`,
+		j.ID, j.AccountID, j.Capability, j.State, j.StartedAt, j.FinishedAt, j.NextRunAt,
+		j.LastSuccessAt, j.RetryCount, j.LastErrorCode, now(), now())
+	return err
+}
+
+// GetRefreshJob 读取任务。
+func (s *Store) GetRefreshJob(ctx context.Context, id string) (RefreshJob, error) {
+	var j RefreshJob
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, account_id, capability, state, started_at, finished_at, next_run_at, last_success_at, retry_count, last_error_code, created_at, updated_at
+		FROM refresh_jobs WHERE id=?`, id).
+		Scan(&j.ID, &j.AccountID, &j.Capability, &j.State, &j.StartedAt, &j.FinishedAt, &j.NextRunAt,
+			&j.LastSuccessAt, &j.RetryCount, &j.LastErrorCode, &j.CreatedAt, &j.UpdatedAt)
+	return j, err
+}
+
+// GetRefreshJobByKey 按账户+能力查任务。
+func (s *Store) GetRefreshJobByKey(ctx context.Context, accountID, capability string) (RefreshJob, bool, error) {
+	var j RefreshJob
+	err := s.db.QueryRowContext(ctx, `
+		SELECT id, account_id, capability, state, started_at, finished_at, next_run_at, last_success_at, retry_count, last_error_code, created_at, updated_at
+		FROM refresh_jobs WHERE account_id=? AND capability=?`, accountID, capability).
+		Scan(&j.ID, &j.AccountID, &j.Capability, &j.State, &j.StartedAt, &j.FinishedAt, &j.NextRunAt,
+			&j.LastSuccessAt, &j.RetryCount, &j.LastErrorCode, &j.CreatedAt, &j.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return RefreshJob{}, false, nil
+	}
+	if err != nil {
+		return RefreshJob{}, false, err
+	}
+	return j, true, nil
+}
+
+// UpdateRefreshJobState 更新任务状态字段。
+func (s *Store) UpdateRefreshJobState(ctx context.Context, id, state, finishedAt, nextRunAt, lastSuccessAt string, retryCount int, lastErrorCode string) error {
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE refresh_jobs SET state=?, finished_at=?, next_run_at=?, last_success_at=?, retry_count=?, last_error_code=?, updated_at=?
+		WHERE id=?`,
+		state, finishedAt, nextRunAt, lastSuccessAt, retryCount, lastErrorCode, now(), id)
+	return err
+}
+
+// ListRefreshJobs 列出任务（可加账户过滤）。
+func (s *Store) ListRefreshJobs(ctx context.Context, accountID string) ([]RefreshJob, error) {
+	q := `SELECT id, account_id, capability, state, started_at, finished_at, next_run_at, last_success_at, retry_count, last_error_code, created_at, updated_at FROM refresh_jobs`
+	args := []any{}
+	if accountID != "" {
+		q += ` WHERE account_id=?`
+		args = append(args, accountID)
+	}
+	q += ` ORDER BY created_at DESC`
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []RefreshJob{}
+	for rows.Next() {
+		var j RefreshJob
+		if err := rows.Scan(&j.ID, &j.AccountID, &j.Capability, &j.State, &j.StartedAt, &j.FinishedAt, &j.NextRunAt,
+			&j.LastSuccessAt, &j.RetryCount, &j.LastErrorCode, &j.CreatedAt, &j.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+// MarkInterruptedRefreshJobs 重启时将遗留 running/pending 标为 interrupted。
+func (s *Store) MarkInterruptedRefreshJobs(ctx context.Context) (int, error) {
+	res, err := s.db.ExecContext(ctx, `UPDATE refresh_jobs SET state='interrupted', updated_at=? WHERE state IN ('running','pending')`, now())
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
 // -------- access_tokens --------
 
 // tokenColumns 是令牌查询列清单（含 migration v4 作用域字段）。

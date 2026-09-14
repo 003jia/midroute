@@ -53,6 +53,46 @@ export type Model = {
   context_limit: number
 }
 
+export type QuotaSnapshot = {
+  id: string
+  account_id: string
+  pool_id?: string
+  window_type: string
+  limit?: number | null
+  used?: number | null
+  remaining?: number | null
+  reset_at?: string | null
+  source: string
+  source_ref?: string
+  confidence: string
+  freshness: string
+  unit: string
+  connector_version: string
+  operator?: string
+  taken_at: string
+}
+
+export type QuotaPool = {
+  id: string
+  provider_id: string
+  external_org?: string
+  scope: string
+  member_ids: string[]
+}
+
+export type RefreshJob = {
+  id: string
+  account_id: string
+  capability: string
+  state: string
+  started_at: string
+  finished_at?: string
+  next_run_at?: string
+  last_success_at?: string
+  retry_count: number
+  last_error_code?: string
+}
+
 export const api = {
   providers: {
     list: () => request<{ data: Provider[] }>('/api/v1/providers'),
@@ -81,8 +121,23 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ api_key: apiKey }),
       }),
+    quota: (id: string) => request<{ data: QuotaSnapshot[] }>(`/api/v1/accounts/${id}/quota`),
+    manualQuota: (id: string, body: { window_type: string; used?: number | null; limit?: number | null; remaining?: number | null; unit?: string }) =>
+      request<QuotaSnapshot>(`/api/v1/accounts/${id}/quota-manual`, { method: 'PUT', body: JSON.stringify(body) }),
+    refresh: (id: string, capability: string) =>
+      request<{ job_id: string; state: string }>(`/api/v1/accounts/${id}/refresh`, {
+        method: 'POST',
+        body: JSON.stringify({ capability }),
+      }),
   },
   models: {
     list: () => request<{ data: Model[] }>('/api/v1/models'),
+  },
+  quotaPools: {
+    list: () => request<{ data: QuotaPool[] }>('/api/v1/quota-pools'),
+  },
+  jobs: {
+    list: (accountId?: string) =>
+      request<{ data: RefreshJob[] }>(`/api/v1/jobs${accountId ? `?account_id=${accountId}` : ''}`),
   },
 }

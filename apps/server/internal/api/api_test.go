@@ -16,6 +16,7 @@ import (
 	"midroute/internal/credentials"
 	"midroute/internal/domain"
 	"midroute/internal/httpserver"
+	"midroute/internal/repository"
 	"midroute/internal/router"
 	"midroute/internal/session"
 	"midroute/internal/testutil"
@@ -440,7 +441,7 @@ func TestCredentialRotationKeepsOldOnFailure(t *testing.T) {
 	decodeBody(t, mustPost(t, base+"/api/v1/providers",
 		`{"kind":"openai","name":"OpenAI","base_url":"`+upstream.URL+`"}`), &prov)
 	var acc struct {
-		ID               string `json:"id"`
+		ID                string `json:"id"`
 		SecretFingerprint string `json:"secret_fingerprint"`
 	}
 	// 初始密钥
@@ -488,6 +489,151 @@ func TestCredentialRotationKeepsOldOnFailure(t *testing.T) {
 	if string(sec.Value) != "sk-new-good-abcdefghijklmnopqrstuvwxyz123456" {
 		t.Fatalf("vault secret mismatch")
 	}
+}
+
+// MR-009：额度池 + 账户快照 + 手工补充 API。
+func TestQuotaPoolsAndManual(t *testing.T) {
+	ts, app := buildServer(t)
+	base := ts.URL
+	ctx := context.Background()
+	var prov struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, mustPost(t, base+"/api/v1/providers", `{"kind":"openai","name":"p","base_url":"http://127.0.0.1:1"}`), &prov)
+	// 两个账户（模拟两个 Key）
+	var acc1, acc2 struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, mustPost(t, base+"/api/v1/accounts",
+		`{"provider_id":"`+prov.ID+`","name":"k1","api_key":"sk-test-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`), &acc1)
+	decodeBody(t, mustPost(t, base+"/api/v1/accounts",
+		`{"provider_id":"`+prov.ID+`","name":"k2","api_key":"sk-test-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`), &acc2)
+
+	// 建共享池（两个 Key 共用额度）
+	resp := mustPost(t, base+"/api/v1/quota-pools",
+		`{"id":"pool1","provider_id":"`+prov.ID+`","external_org":"org-x","scope":"org","member_ids":["`+acc1.ID+`","`+acc2.ID+`"]}`)
+	if resp.StatusCode != 201 {
+		t.Fatalf("create pool: %d", resp.StatusCode)
+	}
+
+	// 账户1 手工补充额度
+	manual := `{"window_type":"primary","used":35,"limit":100,"unit":"percent"}`
+	resp = mustPost(t, base+"/api/v1/accounts/"+acc1.ID+"/quota-manual", manual)
+	if resp.StatusCode != 201 {
+		t.Fatalf("manual quota: %d", resp.StatusCode)
+	}
+	var snap domain.QuotaSnapshot
+	decodeBody(t, resp, &snap)
+	if snap.Source != domain.QuotaSourceManual || snap.Used == nil || *snap.Used != 35 {
+		t.Fatalf("manual snapshot wrong: %+v", snap)
+	}
+
+	// 账户快照列表
+	resp, _ = http.Get(base + "/api/v1/accounts/" + acc1.ID + "/quota")
+	var snaps struct {
+		Data []domain.QuotaSnapshot `json:"data"`
+	}
+	decodeBody(t, resp, &snaps)
+	if len(snaps.Data) != 1 || snaps.Data[0].WindowType != domain.QuotaWindowPrimary {
+		t.Fatalf("account snaps=%+v", snaps.Data)
+	}
+
+	// 池快照（空，因手工快照未归属池；验证端点可用）
+	resp, _ = http.Get(base + "/api/v1/quota-pools/pool1/snapshots")
+	var poolSnaps struct {
+		Data []domain.QuotaSnapshot `json:"data"`
+	}
+	decodeBody(t, resp, &poolSnaps)
+	if poolSnaps.Data == nil {
+		t.Fatal("pool snapshots must be non-nil list")
+	}
+
+	// 池列表
+	resp, _ = http.Get(base + "/api/v1/quota-pools")
+	var pools struct {
+		Data []domain.QuotaPool `json:"data"`
+	}
+	decodeBody(t, resp, &pools)
+	if len(pools.Data) != 1 || len(pools.Data[0].MemberIDs) != 2 {
+		t.Fatalf("pools=%+v", pools.Data)
+	}
+
+	// 审计已记录
+	if n, _ := app.Store.CountAuditEvents(ctx); n == 0 {
+		t.Fatal("audit missing")
+	}
+}
+
+// MR-010：后台刷新任务 API —— 去重、job 状态可查。
+func TestRefreshJobAPI(t *testing.T) {
+	ts, app := buildServer(t)
+	base := ts.URL
+	ctx := context.Background()
+	app.Sched.Register("models", func(_ context.Context, _ string) error { return nil })
+	app.Sched.Register("capabilities", func(_ context.Context, _ string) error { return fmt.Errorf("fail") })
+
+	var prov struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, mustPost(t, base+"/api/v1/providers",
+		`{"kind":"openai","name":"p","base_url":"http://127.0.0.1:1"}`), &prov)
+	var acc struct {
+		ID string `json:"id"`
+	}
+	decodeBody(t, mustPost(t, base+"/api/v1/accounts",
+		`{"provider_id":"`+prov.ID+`","api_key":"sk-test-abcdefghijklmnopqrstuvwxyz123456"}`), &acc)
+
+	// 成功任务
+	resp := mustPost(t, base+"/api/v1/accounts/"+acc.ID+"/refresh", `{"capability":"models"}`)
+	if resp.StatusCode != 202 {
+		t.Fatalf("refresh: %d", resp.StatusCode)
+	}
+	var job1 struct {
+		JobID string `json:"job_id"`
+		State string `json:"state"`
+	}
+	decodeBody(t, resp, &job1)
+	if job1.State != "success" {
+		t.Fatalf("state=%s", job1.State)
+	}
+	// 查 job
+	resp, _ = http.Get(base + "/api/v1/jobs/" + job1.JobID)
+	var j struct {
+		ID    string `json:"id"`
+		State string `json:"state"`
+	}
+	decodeBody(t, resp, &j)
+	if j.ID != job1.JobID {
+		t.Fatalf("job=%s", j.ID)
+	}
+
+	// 失败任务 → 状态 failed，且 next_run_at 非空
+	resp = mustPost(t, base+"/api/v1/accounts/"+acc.ID+"/refresh", `{"capability":"capabilities"}`)
+	var job2 struct {
+		JobID string `json:"job_id"`
+		State string `json:"state"`
+	}
+	decodeBody(t, resp, &job2)
+	resp, _ = http.Get(base + "/api/v1/jobs/" + job2.JobID)
+	var j2 struct {
+		State     string `json:"state"`
+		NextRunAt string `json:"next_run_at"`
+	}
+	decodeBody(t, resp, &j2)
+	if j2.State != "failed" || j2.NextRunAt == "" {
+		t.Fatalf("failed job: state=%s next=%s", j2.State, j2.NextRunAt)
+	}
+
+	// 列表接口
+	resp, _ = http.Get(base + "/api/v1/jobs?account_id=" + acc.ID)
+	var list struct {
+		Data []repository.RefreshJob `json:"data"`
+	}
+	decodeBody(t, resp, &list)
+	if len(list.Data) < 2 {
+		t.Fatalf("jobs len=%d", len(list.Data))
+	}
+	_ = ctx
 }
 
 func decodeBody(t *testing.T, resp *http.Response, out any) {

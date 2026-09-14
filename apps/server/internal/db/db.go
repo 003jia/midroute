@@ -103,6 +103,81 @@ CREATE TABLE account_capabilities (
 );
 `,
 	},
+	{
+		Version: 6,
+		Name:    "quota_pools_and_snapshot_semantics",
+		Up: `
+-- 共享额度池（MR-009）：多个 Key 共用同一官方额度时只统计一次。
+CREATE TABLE quota_pools (
+	id          TEXT PRIMARY KEY,
+	provider_id TEXT NOT NULL REFERENCES providers(id),
+	external_org TEXT NOT NULL DEFAULT '',
+	scope       TEXT NOT NULL DEFAULT 'account',  -- account | org
+	created_at  TEXT NOT NULL,
+	updated_at  TEXT NOT NULL
+);
+CREATE TABLE quota_pool_members (
+	pool_id     TEXT NOT NULL REFERENCES quota_pools(id),
+	account_id  TEXT NOT NULL REFERENCES accounts(id),
+	model_scope TEXT NOT NULL DEFAULT '*',
+	PRIMARY KEY (pool_id, account_id)
+);
+
+-- 快照语义重建（MR-009）：未知=null，零=0；来源/可信度/新鲜度分列。
+CREATE TABLE quota_snapshots_new (
+	id                  TEXT PRIMARY KEY,
+	account_id          TEXT NOT NULL REFERENCES accounts(id),
+	pool_id             TEXT NOT NULL DEFAULT '',
+	window_type         TEXT NOT NULL,          -- primary | secondary | additional-<名> | code-review
+	limit_value         REAL,
+	used                REAL,
+	remaining           REAL,
+	reset_at            TEXT,
+	source              TEXT NOT NULL DEFAULT 'observed',  -- official|reported|observed|estimated|manual
+	source_ref          TEXT NOT NULL DEFAULT '',
+	confidence          TEXT NOT NULL DEFAULT 'reported',  -- exact|reported|estimated|unavailable
+	freshness           TEXT NOT NULL DEFAULT 'unknown',   -- fresh|stale|unknown
+	unit                TEXT NOT NULL DEFAULT 'percent',   -- percent|tokens|requests|currency
+	connector_version   TEXT NOT NULL DEFAULT '',
+	operator            TEXT NOT NULL DEFAULT '',
+	manual_expires_at   TEXT NOT NULL DEFAULT '',
+	taken_at            TEXT NOT NULL,
+	last_success_at     TEXT NOT NULL DEFAULT '',
+	CHECK (pool_id <> '' OR window_type <> '')
+);
+INSERT INTO quota_snapshots_new(id, account_id, window_type, limit_value, used, remaining, reset_at, source, confidence, taken_at)
+	SELECT id, account_id, quota_type, limit_value, used, remaining,
+		CASE WHEN reset_at = '' THEN NULL ELSE reset_at END,
+		source, confidence, taken_at
+	FROM quota_snapshots;
+DROP TABLE quota_snapshots;
+ALTER TABLE quota_snapshots_new RENAME TO quota_snapshots;
+CREATE INDEX idx_quota_snapshots_account ON quota_snapshots(account_id, taken_at);
+CREATE INDEX idx_quota_snapshots_pool ON quota_snapshots(pool_id, taken_at);
+`,
+	},
+	{
+		Version: 7,
+		Name:    "refresh_jobs",
+		Up: `
+-- 后台刷新任务（MR-010）：账户+能力去重，状态机，退避，重启中断标记。
+CREATE TABLE refresh_jobs (
+	id               TEXT PRIMARY KEY,
+	account_id       TEXT NOT NULL,
+	capability       TEXT NOT NULL,           -- models | capabilities | health | quota
+	state            TEXT NOT NULL DEFAULT 'pending',  -- pending|running|success|failed|interrupted
+	started_at       TEXT NOT NULL DEFAULT '',
+	finished_at      TEXT NOT NULL DEFAULT '',
+	next_run_at      TEXT NOT NULL DEFAULT '',
+	last_success_at  TEXT NOT NULL DEFAULT '',
+	retry_count      INTEGER NOT NULL DEFAULT 0,
+	last_error_code  TEXT NOT NULL DEFAULT '',
+	created_at       TEXT NOT NULL,
+	updated_at       TEXT NOT NULL,
+	UNIQUE (account_id, capability)
+);
+`,
+	},
 }
 
 // KnownVersion 当前程序支持的最高 schema 版本。

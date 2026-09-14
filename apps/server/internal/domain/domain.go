@@ -56,12 +56,12 @@ const (
 type CapabilityStatus string
 
 const (
-	CapabilitySupported           CapabilityStatus = "supported"
-	CapabilityUnsupported         CapabilityStatus = "unsupported"
-	CapabilityPermissionRequired  CapabilityStatus = "permission_required"
-	CapabilityReauthRequired      CapabilityStatus = "reauth_required"
-	CapabilityError               CapabilityStatus = "error"
-	CapabilityUnknown             CapabilityStatus = "unknown"
+	CapabilitySupported          CapabilityStatus = "supported"
+	CapabilityUnsupported        CapabilityStatus = "unsupported"
+	CapabilityPermissionRequired CapabilityStatus = "permission_required"
+	CapabilityReauthRequired     CapabilityStatus = "reauth_required"
+	CapabilityError              CapabilityStatus = "error"
+	CapabilityUnknown            CapabilityStatus = "unknown"
 )
 
 // CapabilityName 能力名称（账户能力矩阵）。
@@ -80,12 +80,87 @@ const (
 
 // AccountCapability 账户单项能力结果（不保存原始认证响应）。
 type AccountCapability struct {
-	AccountID        string          `json:"account_id"`
-	Capability       CapabilityName  `json:"capability"`
+	AccountID        string           `json:"account_id"`
+	Capability       CapabilityName   `json:"capability"`
 	Status           CapabilityStatus `json:"status"`
-	Reason           string          `json:"reason,omitempty"`
+	Reason           string           `json:"reason,omitempty"`
+	ConnectorVersion string           `json:"connector_version"`
+	CheckedAt        string           `json:"checked_at"`
+}
+
+// QuotaSource 额度数据来源（合约 v1 §source）。
+type QuotaSource string
+
+const (
+	QuotaSourceOfficial  QuotaSource = "official"
+	QuotaSourceReported  QuotaSource = "reported"
+	QuotaSourceObserved  QuotaSource = "observed"
+	QuotaSourceEstimated QuotaSource = "estimated"
+	QuotaSourceManual    QuotaSource = "manual"
+)
+
+// QuotaConfidence 精度（合约 v1 §confidence）。
+type QuotaConfidence string
+
+const (
+	QuotaConfExact       QuotaConfidence = "exact"
+	QuotaConfReported    QuotaConfidence = "reported"
+	QuotaConfEstimated   QuotaConfidence = "estimated"
+	QuotaConfUnavailable QuotaConfidence = "unavailable"
+)
+
+// QuotaFreshness 时效（合约 v1 §freshness）。
+type QuotaFreshness string
+
+const (
+	QuotaFreshFresh   QuotaFreshness = "fresh"
+	QuotaFreshStale   QuotaFreshness = "stale"
+	QuotaFreshUnknown QuotaFreshness = "unknown"
+)
+
+// QuotaWindowType 窗口类型（合约 v1 §window）。
+type QuotaWindowType string
+
+const (
+	QuotaWindowPrimary    QuotaWindowType = "primary"
+	QuotaWindowSecondary  QuotaWindowType = "secondary"
+	QuotaWindowAdditional QuotaWindowType = "additional"
+	QuotaWindowCodeReview QuotaWindowType = "code-review"
+	QuotaWindowDaily      QuotaWindowType = "day"
+	QuotaWindowMonthly    QuotaWindowType = "month"
+	QuotaWindowBilling    QuotaWindowType = "billing"
+	QuotaWindowUnknown    QuotaWindowType = "unknown"
+)
+
+// QuotaSnapshot 一次额度窗口快照。数值字段 nil=未知，0=真零，严禁伪造。
+type QuotaSnapshot struct {
+	ID               string          `json:"id"`
+	AccountID        string          `json:"account_id"`
+	PoolID           string          `json:"pool_id,omitempty"`
+	WindowType       QuotaWindowType `json:"window_type"`
+	Limit            *float64        `json:"limit"`
+	Used             *float64        `json:"used"`
+	Remaining        *float64        `json:"remaining"`
+	ResetAt          *string         `json:"reset_at,omitempty"`
+	Source           QuotaSource     `json:"source"`
+	SourceRef        string          `json:"source_ref,omitempty"`
+	Confidence       QuotaConfidence `json:"confidence"`
+	Freshness        QuotaFreshness  `json:"freshness"`
+	Unit             string          `json:"unit"`
 	ConnectorVersion string          `json:"connector_version"`
-	CheckedAt        string          `json:"checked_at"`
+	Operator         string          `json:"operator,omitempty"`
+	ManualExpiresAt  *string         `json:"manual_expires_at,omitempty"`
+	TakenAt          string          `json:"taken_at"`
+	LastSuccessAt    string          `json:"last_success_at,omitempty"`
+}
+
+// QuotaPool 共享额度池。
+type QuotaPool struct {
+	ID          string   `json:"id"`
+	ProviderID  string   `json:"provider_id"`
+	ExternalOrg string   `json:"external_org,omitempty"`
+	Scope       string   `json:"scope"` // account | org
+	MemberIDs   []string `json:"member_ids"`
 }
 
 // Account 平台账户。凭据仅以 SecretRef 引用形式存在。

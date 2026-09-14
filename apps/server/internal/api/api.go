@@ -23,8 +23,10 @@ import (
 	"midroute/internal/domain"
 	"midroute/internal/errs"
 	"midroute/internal/httpserver"
+	"midroute/internal/quota"
 	"midroute/internal/repository"
 	"midroute/internal/router"
+	"midroute/internal/scheduler"
 )
 
 // App 聚合依赖。
@@ -39,6 +41,10 @@ type App struct {
 	OAuth map[string]*oauth.Service
 	// Caps 账户能力检查器（MR-006）。
 	Caps *accounts.CapabilityChecker
+	// QuotaSvc 额度快照服务（MR-009）。
+	QuotaSvc *quota.Service
+	// Sched 后台刷新调度（MR-010）。
+	Sched *scheduler.Scheduler
 	// httpClient 推理转发使用的共享客户端（带超时/连接限制的由 main 注入）。
 	httpClient *http.Client
 	flows      *oauthFlows
@@ -58,6 +64,8 @@ func NewApp(store *repository.Store, v credentials.Vault, r *router.Router, log 
 	app.Caps = accounts.New(store, func(ctx context.Context, acc domain.Account) (*connectors.Target, error) {
 		return app.resolveTarget(ctx, acc, "")
 	})
+	app.QuotaSvc = quota.New(store)
+	app.Sched = scheduler.New(store, log)
 	return app
 }
 
@@ -81,11 +89,38 @@ func (a *App) Mount(srv *httpserver.Server) {
 	srv.MountFunc("/api/v1/projects/", a.projectAction)
 	srv.MountFunc("/api/v1/routing-policies", a.handleRoutingPolicies)
 	srv.MountFunc("/api/v1/routing-policies/", a.handleRoutingPolicyByAlias)
+	srv.MountFunc("/api/v1/quota-pools", a.handleQuotaPools)
+	srv.MountFunc("/api/v1/quota-pools/", a.handleQuotaPoolSnapshots)
+	srv.MountFunc("/api/v1/jobs", a.handleJobs)
+	srv.MountFunc("/api/v1/jobs/", a.handleJob)
 	srv.MountFunc("/api/v1/oauth/", a.oauthAction)
 	// 网关（推理）API：项目令牌鉴权（httpserver 对 /v1/* 不施加管理 Guard）
 	srv.MountFunc("/v1/models", a.requireToken(a.handleGatewayModels))
 	srv.MountFunc("/v1/chat/completions", a.requireToken(a.handleChatCompletions))
 	srv.MountFunc("/v1/responses", a.requireToken(a.handleResponses))
+}
+
+// runDiscover 执行账户模型发现并落库（调度任务用；错误由调用方处理）。
+func (a *App) RunDiscover(ctx context.Context, acc domain.Account) error {
+	target, err := a.resolveTarget(ctx, acc, "")
+	if err != nil {
+		return err
+	}
+	conn := connectors.NewConnector(target.ProviderKind, connectors.Options{})
+	infos, err := conn.DiscoverModels(ctx, *target)
+	if err != nil {
+		return err
+	}
+	models := make([]domain.Model, 0, len(infos))
+	rows := make([]repository.ModelInfoRow, 0, len(infos))
+	for _, mi := range infos {
+		models = append(models, domain.Model{ID: provModelID(acc.ProviderID, mi.UpstreamID), ProviderID: acc.ProviderID, UpstreamID: mi.UpstreamID, ContextLimit: mi.ContextLimit})
+		rows = append(rows, repository.ModelInfoRow{ModelID: provModelID(acc.ProviderID, mi.UpstreamID), Listed: true, Usable: true})
+	}
+	if err := a.Store.UpsertModels(ctx, models); err != nil {
+		return err
+	}
+	return a.Store.SaveAccountModels(ctx, acc.ID, rows)
 }
 
 // ResolveForRouter 实现 router.Resolver：账户 → 可执行目标。
@@ -384,6 +419,27 @@ func (a *App) accountSubAction(w http.ResponseWriter, r *http.Request, accountID
 		}
 		a.rotateCredential(w, r, accountID, acc)
 		return
+	case "quota":
+		if r.Method != http.MethodGet {
+			httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "请用 GET"))
+			return
+		}
+		a.accountQuota(w, r, accountID)
+		return
+	case "quota-manual":
+		if r.Method != http.MethodPut && r.Method != http.MethodPost {
+			httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "请用 PUT/POST"))
+			return
+		}
+		a.accountManualQuota(w, r, accountID)
+		return
+	case "refresh":
+		if r.Method != http.MethodPost {
+			httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "请用 POST"))
+			return
+		}
+		a.refreshAccount(w, r, accountID)
+		return
 	case "verify", "discover":
 	default:
 		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "不支持的动作: "+action))
@@ -497,6 +553,80 @@ func (a *App) resolveTargetFromRef(ctx context.Context, prov domain.Provider, re
 	}, nil
 }
 
+// -------- 刷新任务（MR-010）--------
+
+// refreshAccount 触发账户的指定能力刷新（去重，异步 202 + job_id）。
+func (a *App) refreshAccount(w http.ResponseWriter, r *http.Request, accountID string) {
+	if _, err := a.Store.GetAccount(r.Context(), accountID); err != nil {
+		if err == sql.ErrNoRows {
+			httpserver.WriteError(w, errs.New(errs.CodeNotFound, "账户不存在"))
+			return
+		}
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询账户失败", err))
+		return
+	}
+	var in struct {
+		Capability string `json:"capability"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.Capability == "" {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "缺少 capability"))
+		return
+	}
+	if a.Sched == nil {
+		httpserver.WriteError(w, errs.New(errs.CodeInternal, "调度器未装配"))
+		return
+	}
+	job, err := a.Sched.Enqueue(r.Context(), accountID, in.Capability)
+	if err != nil {
+		if errors.Is(err, scheduler.ErrBusy) {
+			if job != nil {
+				httpserver.WriteJSON(w, http.StatusOK, map[string]any{"job_id": job.ID, "busy": true})
+				return
+			}
+			httpserver.WriteJSON(w, http.StatusAccepted, map[string]any{"busy": true})
+			return
+		}
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "创建刷新任务失败", err))
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusAccepted, map[string]any{"job_id": job.ID, "state": job.State})
+}
+
+// handleJob 查询任务状态。
+func (a *App) handleJob(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	// [api v1 jobs <id>]
+	if len(parts) != 4 {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "路径无效"))
+		return
+	}
+	job, err := a.Store.GetRefreshJob(r.Context(), parts[3])
+	if err != nil {
+		if err == sql.ErrNoRows {
+			httpserver.WriteError(w, errs.New(errs.CodeNotFound, "任务不存在"))
+			return
+		}
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询任务失败", err))
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, job)
+}
+
+// handleJobs 列出任务（可选 ?account_id=）。
+func (a *App) handleJobs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
+		return
+	}
+	accountID := r.URL.Query().Get("account_id")
+	jobs, err := a.Store.ListRefreshJobs(r.Context(), accountID)
+	if err != nil {
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询任务失败", err))
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, map[string]any{"data": jobs})
+}
+
 // -------- providers 生命周期（MR-004）--------
 
 func (a *App) providerAction(w http.ResponseWriter, r *http.Request) {
@@ -557,6 +687,92 @@ func (a *App) providerAction(w http.ResponseWriter, r *http.Request) {
 	default:
 		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
 	}
+}
+
+// -------- 额度池与快照（MR-009）--------
+
+func (a *App) handleQuotaPools(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		list, err := a.Store.ListQuotaPools(r.Context())
+		if err != nil {
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询额度池失败", err))
+			return
+		}
+		httpserver.WriteJSON(w, http.StatusOK, map[string]any{"data": list})
+	case http.MethodPost:
+		var in domain.QuotaPool
+		if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.ID == "" || in.ProviderID == "" {
+			httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "缺少 id 或 provider_id"))
+			return
+		}
+		if len(in.MemberIDs) == 0 {
+			httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "缺少 member_ids"))
+			return
+		}
+		if err := a.Store.SaveQuotaPool(r.Context(), in); err != nil {
+			httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "保存额度池失败", err))
+			return
+		}
+		_ = a.Store.RecordAuditEvent(r.Context(), "admin", "quota_pool.create", in.ID, fmt.Sprintf("members=%d", len(in.MemberIDs)))
+		httpserver.WriteJSON(w, http.StatusCreated, map[string]any{"id": in.ID})
+	default:
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
+	}
+}
+
+func (a *App) handleQuotaPoolSnapshots(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	// [api v1 quota-pools <id> snapshots]
+	if len(parts) != 5 || parts[4] != "snapshots" {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "路径无效"))
+		return
+	}
+	if r.Method != http.MethodGet {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "方法不支持"))
+		return
+	}
+	snaps, err := a.Store.ListPoolSnapshots(r.Context(), parts[3])
+	if err != nil {
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询快照失败", err))
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, map[string]any{"data": snaps})
+}
+
+// accountQuota 读取账户额度快照。
+func (a *App) accountQuota(w http.ResponseWriter, r *http.Request, accountID string) {
+	snaps, err := a.Store.ListQuotaSnapshots(r.Context(), accountID)
+	if err != nil {
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "查询额度失败", err))
+		return
+	}
+	httpserver.WriteJSON(w, http.StatusOK, map[string]any{"data": snaps})
+}
+
+// accountManualQuota 手写额度值（PUT 语义：补充而非覆盖官方）。
+func (a *App) accountManualQuota(w http.ResponseWriter, r *http.Request, accountID string) {
+	var in domain.QuotaSnapshot
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil || in.WindowType == "" {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "缺少 window_type"))
+		return
+	}
+	// 数值缺省必须显式：手工填 0 是 0，未知应传 null
+	if in.Used == nil && in.Remaining == nil && in.Limit == nil {
+		httpserver.WriteError(w, errs.New(errs.CodeInvalidRequest, "请至少提供 limit/used/remaining 之一"))
+		return
+	}
+	if a.QuotaSvc == nil {
+		httpserver.WriteError(w, errs.New(errs.CodeInternal, "额度服务未装配"))
+		return
+	}
+	snap, err := a.QuotaSvc.ManualSupplement(r.Context(), accountID, "admin", in)
+	if err != nil {
+		httpserver.WriteError(w, errs.Wrap(errs.CodeInternal, "写入手工额度失败", err))
+		return
+	}
+	_ = a.Store.RecordAuditEvent(r.Context(), "admin", "quota.manual", accountID, string(snap.WindowType))
+	httpserver.WriteJSON(w, http.StatusCreated, snap)
 }
 
 // -------- tokens（MR-016 / PRD M2 Token 数据模型）--------
