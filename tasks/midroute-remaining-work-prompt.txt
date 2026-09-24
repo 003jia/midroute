@@ -1,230 +1,91 @@
 你现在要继续开发 Midroute 自主中间路由平台。
 
 项目目录：/Users/jiayancheng/Documents/api集中管理平台
-产品 PRD：tasks/prd-midroute-independent-platform.md
-实施清单：tasks/midroute-implementation-checklist.md
-代码问题清单：tasks/midroute-code-audit-issues.md
+代码基线：25123ff；任务整理日期：2026-09-18。
 
-一、当前基线
+先读：
+1. tasks/midroute-implementation-checklist.md：唯一任务状态入口，含 32 项 MR 的完成/待办总览、实现步骤、依赖和规范。
+2. tasks/midroute-code-audit-issues.md：当前缺陷及修复边界。
+3. outputs/validation/PROJECT-STATUS-2026-09-18.md：最近核对与验证结果。
+4. tasks/prd-midroute-independent-platform.md：产品目标；docs/contracts、docs/provider-capabilities.md、docs/source-ledger.md：数据、能力和来源约束。
 
-以下内容已经存在，不要重复搭建，也不要把它们重新改造成 OneAPI、CLIProxyAPI 或 CPA-Manager-Plus 的运行服务：
+当前统计：48 个已完成子项、69 个待办，共 117 项。
+此口径由原 96 个复合验收框拆分并纠偏而来，不是新增功能数量或发布完成百分比。历史文档不能覆盖当前任务状态。
 
-1. 单个 Go 后端入口：apps/server/cmd/server。
-2. React + TypeScript 前端骨架：apps/web。
-3. SQLite 版本化 migration、Keychain/Vault、SecretRef 和本地安全边界。
-4. OpenAI-compatible、Anthropic、Gemini Connector 的基础验证、模型发现和转发能力。
-5. /v1/chat/completions、/v1/models、/v1/responses 基础路径。
-6. Responses 协议原样透传、previous_response_id 账户绑定。
-7. OAuth 管理 API 的 start、complete、flows、revoke 基础接线。
-8. Codex 额度响应头解析器和 Provider 能力矩阵初版。
-9. 项目访问令牌、模型白名单、过期时间和进程内并发限制。
-10. M0/M1 工程基线、安全边界、构建、测试和基础冒烟已经通过。
+一、已经完成的部分，直接复用
 
-目前不要宣称 Coding Plan、真实 OAuth、额度监测、完整管理界面或完整费用统计已经完成。mock 测试通过不等于真实平台验收通过。
+- 单个 Go 服务、React/TypeScript 前端、SQLite 增量迁移、根目录构建/测试入口。
+- 静态页托管、loopback 免重复管理登录、会话/Host/同源写访问边界。
+- Provider/账户核心生命周期、Keychain/SecretRef、凭据轮换、仅监测过滤、能力矩阵。
+- Accounts、Models、Quota 页面代码；类型检查、lint 和构建通过，浏览器验收仍未完成。
+- OAuth 管理 API、PKCE、刷新单飞、失效状态和凭据轮换；真实授权未验收。
+- Codex 额度响应头解析 fixture、额度池/成员/历史快照、手工补充。
+- 手动刷新执行器、任务去重、失败计数/下次时间记录、重启 interrupted 标记；没有自动执行循环。
+- Chat Completions、Responses 原样透传/句柄绑定、原生 Anthropic Messages/count_tokens。
+- 项目令牌 API、权限校验、单令牌并发、请求尝试幂等和详情 API。
+- 部分管理审计写入、定点价格版本、事件时取价、本地用量汇总。
+- 健康评分引擎、默认 data/ 主库在线备份、来源台账、扫描脱敏。
 
-二、必须继续完成的任务
+不得重复搭建这些模块，也不得重新引入 OneAPI、CLIProxyAPI、CPA 的运行服务。上游仅为已登记来源的选择性移植参考。
 
-请按照以下依赖顺序执行。每完成一个任务，都更新 tasks/midroute-implementation-checklist.md、tasks/midroute-code-audit-issues.md 和 outputs/validation/，不得只改 README。
+二、按依赖推进剩余工作
 
-【P0-1：完成账户和能力管理】
+批次 A：先把数据修准
+对应 MR-008/009/012/015/019，ISS-10/11/15/20/21。
+1. 额度百分比、窗口时长、作用范围和重置来源分字段保存；修复 WindowMinutes 写入 percent 快照 Limit。
+2. 补齐 Chat SSE usage/final chunk，保留 reasoning/cache read/cache write 含义。
+3. 缺 usage、取消、断流、结果未知时写入明确完整度，不能显示为已知 0 Token。
+4. 缺价格或仅部分记录有价格时给出不可估算/部分估算状态；处理 SQL NULL，输出真实的可估算字段。
+5. 验证 input/cache/reasoning 包含关系、币种边界和价格版本；补时间聚合及同范围的真实账单对账。
+6. 保留现有首块后禁止整请求重放、状态句柄原账户绑定、请求尝试幂等。
 
-对应任务：MR-004、MR-005、MR-006。
+批次 B：补日常操作
+对应 MR-004/005/010/011/015/016/017。
+1. 将自动计划、实际重试、暂停、恢复接入服务生命周期；next_run_at 本身不等于调度完成。
+2. 补 Retry-After、授权失效暂停、全局并发、休眠补跑和持久化错误处理。
+3. 补凭据清理失败重试、审计查询/覆盖/写入失败处理。
+4. 实现同项目多个令牌共享并发边界；现有计数只按 tokenID。
+5. 增加令牌/客户端配置/请求详情页面；复用已有后端，勿重建 Accounts/Models/Quota。
+6. 补额度单位、趋势与倒计时；实际完成桌面和移动浏览器验收。
 
-实现内容：
+批次 C：跑通首个真实闭环
+对应 MR-006/007/008/013/018；Claude Code 另对应 MR-014。
+1. 用已授权真实账户分别验证登录、刷新、模型发现、套餐/窗口读取与推理。
+2. 首个工具默认 Codex，完成文本、工具调用/结果、流式取消、有状态续接和重启复查。
+3. 对照请求详情与实际用量，记录 Provider、客户端、Connector 版本、日期和脱敏结果。
+4. 无权限或平台不支持时明确 unsupported/permission_required/unknown，不把普通 API Key 成功视为 Coding Plan 成功。
+5. Claude Code 保持原生 Messages 透传，单独验证真实工具往返和 beta/count_tokens 范围。
 
-1. 补齐 Provider/Account 的详情、编辑、禁用、重新启用和删除接口。
-2. 支持 monitor_only 与 relay_and_monitor 两种账户模式。
-3. 增加账户能力矩阵：模型发现、请求转发、OAuth、套餐读取、额度读取、刷新、健康探测。
-4. 每个能力必须返回 supported、unsupported、permission_required、reauth_required 或 unknown，以及原因、Connector 版本和检查时间。
-5. 前端完成账户列表、添加向导、编辑、禁用、删除、验证和模型发现页面。
-6. 仅监测账户绝不能进入路由候选。
+批次 D：完成日常监测和费用控制
+对应 MR-020–027，ISS-14/16。
+1. 预算预留、结算、取消、重复提交、崩溃恢复和显式付费回退。
+2. 网关采集 TTFT/总延迟/错误，写 health_samples，提供健康和历史 API。
+3. 熔断/半开/恢复、同级权重、共享额度与健康过滤；样本不足不误判拥堵。
+4. 主动推理探测需明确开启并有频率/费用预算，消耗单独记录。
+5. 提醒去重、冷却、恢复事件；完成路由、用量、预算、对账、健康、设置和通知页面。
+6. 管理事件流断线/休眠/切页不重复订阅，缓存不能冒充实时数据。
 
-注意事项：
+批次 E：恢复和发布
+对应 MR-001/002/003/028–032，ISS-01/04/06/22。
+1. 修复显式 SMOKE_DATA 任意目录删除；修复前不要使用该参数。此项可独立提前处理。
+2. 生产静态资源缺失处理、嵌套依赖/构建物扫描排除。
+3. 备份遵守实际配置数据目录及明确白名单，默认不携带明文凭据。
+4. 恢复到新目录，测试损坏包/旧库/未来 schema/凭据缺失，不覆盖运行目录。
+5. OneAPI 只读 dry-run 导入、冲突报告、幂等 apply；不修改源库。
+6. 来源、许可证和依赖门禁；macOS 安装升级、Docker 凭据持久化、完整发布回归。
+7. 普通 API Key、Codex、Claude Code 等兼容范围逐项标支持/部分/不支持/未验证。
 
-- 更换凭据时先保存新 SecretRef，验证成功后再原子切换；验证失败必须保留旧凭据。
-- API、日志、错误、截图和浏览器持久存储中不得出现完整密钥。
-- 删除账户前检查路由策略、历史用量和额度快照引用；有历史数据时保留历史归属。
-- 账户“能登录”“能转发”“能读套餐”“能读额度”必须分别判断，不能用一次 API 成功代替全部能力。
-- 不要因为某平台存在网页显示额度，就假定存在可合法调用的额度 API。
+三、实现与验收规则
 
-【P0-2：完成首个真实 Coding Plan 额度闭环】
+- 按实施清单第 3、5、6 节执行；先处理字段合约与 migration，再处理 repository/service/API/UI。
+- Go 使用 gofmt/go vet、errors.Is/As；前端遵守 strict TypeScript、完整空态/加载/错误/过期状态。
+- unknown 数值为 null；source、confidence、availability、freshness 分开；5 小时和每周窗口不相加。
+- 官方账单与本地观测分开；金额用定点数，缺价格不显示免费。
+- SecretRef 持久化；密钥、OAuth Token/code/state/verifier、请求正文不进入普通日志、导出或截图。
+- 真实测试只使用已授权账户；缺凭据时继续独立代码/fixture，保留真实验收待办。
+- 功能改动执行适当的单测、根目录 test/build/smoke；并发改动补 race，界面改动补桌面 1440×900/移动 390×844。
+- 仅整理文档时检查链接、统计和差异即可，不重复跑与改动无关的功能测试。
+- outputs/validation/MR-NNN-YYYY-MM-DD.md 留存日期、代码版本、命令/操作、退出码、范围与未验证项。
+- 将完成子项标为 [x]，剩余部分拆为独立 [ ]；同步总览、问题清单、README 和本提示词。只有对应 MR 全部要求通过才标整项已验收。
 
-对应任务：MR-007、MR-008、MR-009、MR-010、MR-011。
-
-实现内容：
-
-1. 完成已验证平台的 OAuth 授权码/PKCE 或平台实际要求的授权流程。
-2. 完成 Token 刷新、刷新失败保留旧凭据、明确 reauth_required 和本地撤销。
-3. 读取套餐、订阅状态、5 小时窗口、一周窗口及重置时间；无法读取时返回明确 unavailable 或 permission_required。
-4. 建立共享额度池，多个 Key 共用同一额度时只统计一次。
-5. 增加 quota_snapshots 历史查询、手工补充和来源/可信度/新鲜度字段。
-6. 增加后台刷新任务：去重、超时、并发上限、Retry-After、退避、失败恢复和任务状态查询。
-7. 完成套餐总览和额度窗口页面。
-
-注意事项：
-
-- unknown 不能写成 0；真正的零额度才写 0。
-- official、reported、observed、estimated、manual 必须分开；不要把官方账单和本地观测直接相加。
-- 5 小时、一周、自然日和账单周期是不同窗口，不能互相推导。
-- 没有官方 reset_at 时，不得使用“当前时间 + 5 小时”伪造重置时间。
-- 手工数据不能覆盖官方原始快照；官方恢复后仍要保留历史差异。
-- 缺少真实账户或权限时，只能完成 fixture、mock 和能力声明，不能勾选真实验收项。
-- Token、refresh_token、OAuth code、state、PKCE verifier 不得进入 URL 日志、普通数据库字段或 Git。
-
-【P0-3：完成中继可靠性和请求记录】
-
-对应任务：MR-012、MR-013、MR-015、MR-016、MR-017、MR-018。
-
-实现内容：
-
-1. 将上游错误改为结构化错误类型，通过 errors.Is/As 判断限流、鉴权、超时、网络、额度耗尽和服务错误。
-2. 修复 OpenAI-compatible 流式 usage 解析，记录最终 usage 块。
-3. 补齐 reasoning_tokens、cache read、cache write 的记录和费用口径。
-4. 流式请求首个响应块发出后禁止整请求重放；首块前失败才允许按照规则切换。
-5. 流式断开、客户端取消、上游超时和 usage 缺失必须标记 incomplete 或 unknown，不能记为成功且 0 Token。
-6. 引入 request_id + attempt_id 幂等记录，每一次真实上游尝试都要单独记录。
-7. 完成项目访问令牌的预算、模型白名单、并发限制和撤销路径。
-8. 完成客户端配置片段和请求详情页面。
-9. 用真实 Codex 客户端验证文本、工具调用、流式取消和 previous_response_id。
-
-注意事项：
-
-- 不得用 strings.Contains(err.Error()) 作为重试和错误分类依据。
-- 不得把一次逻辑请求的多次真实上游尝试合并成一条消耗。
-- 不得在流式输出已经开始后切换账户重新发送请求。
-- 不要为了通过 mock 测试而宣称 Codex 已兼容；必须记录具体客户端版本和真实调用结果。
-- Responses 的状态句柄必须绑定原账户；不能把有状态请求切换到另一个账户。
-- 管理员会话和项目推理令牌必须分离；项目令牌不能访问管理 API。
-
-【P1-1：完成 Anthropic 协议兼容】
-
-对应任务：MR-014。
-
-实现内容：
-
-1. 实现 /v1/messages。
-2. 实现 /v1/messages/count_tokens，或明确返回 unsupported。
-3. 保留 anthropic-version、anthropic-beta 和客户端要求的必要请求头。
-4. 支持 tool_use、tool_result、input_json_delta、缓存字段和流式事件。
-5. 使用真实 Claude Code 客户端验证消息、工具调用、流式和计数能力。
-
-注意事项：
-
-- 只处理 text_delta 会静默丢失工具调用，禁止这样发布。
-- 非原生精确 Token 计数只能标记 estimated，不能伪装成官方精确计数。
-- 不支持的 beta 或内容块必须返回稳定错误，不得静默删除字段。
-
-【P1-2：完成用量、费用、预算和对账】
-
-对应任务：MR-019、MR-020、MR-027。
-
-实现内容：
-
-1. 为 price_versions 实现写入、按生效时间取价和版本边界计算。
-2. 按小时、日、周、项目、Provider、账户和模型聚合 Token、请求和费用。
-3. 对 input、output、cache read、cache write、reasoning 使用正确的包含关系。
-4. 官方账单、本地观测、套餐消耗和主动探测消耗分列展示。
-5. 缺价格、缺 usage、账单延迟、币种不同或窗口不一致时显示不可估算或差异，不显示为零成本。
-6. 增加项目日/月预算、预留、结算、取消、失败和待核实状态。
-7. 默认关闭订阅耗尽后的按量付费自动回退，用户必须显式开启。
-
-注意事项：
-
-- 金额不能用 float64 直接累加，使用定点金额或十进制定精度。
-- reasoning/cache 可能是 input/output 的子集，不能重复相加。
-- 未通过 Midroute 的平台消耗不能伪装成本地请求。
-- 本地预算是控制边界，不等于 Provider 官方账单硬限制，界面要写清覆盖范围。
-
-【P1-3：完成健康、拥挤度和智能路由】
-
-对应任务：MR-021、MR-022、MR-023、MR-024、MR-025、MR-026。
-
-实现内容：
-
-1. 将 TTFT、总延迟、429、5xx、超时和错误分类写入 health_samples。
-2. 增加 /api/v1/health 和历史趋势 API。
-3. 将健康评分、置信度、统计窗口、滞回和熔断接入实际路由。
-4. 实现优先级、同优先级权重、固定模型、套餐优先、费用优先和速度优先策略。
-5. 补齐额度耗尽、认证失效、熔断和恢复的候选过滤。
-6. 主动探测设置频率、并发和每日费用预算；探测请求必须单独标记。
-7. 增加额度临界、授权失效、持续故障和预算超限提醒，并做事件去重。
-8. 完成健康、路由、设置和提醒页面，支持实时刷新、断线重连和过期数据提示。
-
-注意事项：
-
-- 样本不足时只能显示 unknown/低置信度，不能自动切换渠道。
-- 一个账户额度耗尽不能直接判定整个 Provider 拥堵。
-- Weight 字段必须实际参与选择并有统计测试，不能只存在数据库里。
-- 主动探测可能产生费用，未设置预算时禁止自动发起有费用风险的请求。
-- 断线重连不能创建重复订阅或刷新风暴。
-
-【P1-4：审计、迁移和恢复】
-
-对应任务：MR-003、MR-015、MR-028、MR-029、MR-030。
-
-实现内容：
-
-1. 增加 audit 读写服务，记录账户、策略、令牌、OAuth、导入和路由决策。
-2. 审计记录只保存脱敏摘要、request_id、reason_code 和时间。
-3. 备份默认只包含 Midroute 数据库、非敏感元数据、schema/app 版本和校验和。
-4. 增加安全恢复入口，恢复到新目录验证通过后再切换运行目录。
-5. 增加 OneAPI SQLite 只读导入器，默认 dry-run，输出冲突报告和幂等结果。
-6. 增加依赖、许可证、来源 SHA 和未登记大段代码门禁。
-
-注意事项：
-
-- 不修改或覆盖旧 OneAPI 数据库。
-- 不把 local.keys、data.key、API Key、OAuth Token 放进默认备份包。
-- 不把恢复失败的数据直接写回正在运行的目录。
-- 未登记来源、许可证不明或 AGPL 源码不能直接复制进项目。
-- 自动许可证扫描不能替代人工来源审查。
-
-【P2：发布和完整验收】
-
-对应任务：MR-031、MR-032。
-
-实现内容：
-
-1. 交付 macOS arm64 单服务包，包含后端、静态前端、版本和许可证信息。
-2. 验证干净环境安装、升级、重启、Keychain 凭据恢复和失败恢复。
-3. Docker 只有在非 root、持久数据卷、远程认证和凭据持久化均验证后才发布。
-4. 生成完整兼容矩阵：普通 API Key、Codex、Claude Code、Gemini CLI、其他平台分别标明已支持、部分支持、不支持和未验证。
-5. 生成 release validation 文档，记录命令、版本、日期、真实账户范围和遗留问题。
-
-三、统一开发规范
-
-1. 先读对应 MR 和问题编号，再改代码；只修改任务范围内的文件。
-2. 跨模块字段先更新 docs/contracts，再更新 migration、domain、repository、service、API 和页面。
-3. Go 必须 gofmt、go vet；错误用 errors.Is/As 分类，context.Context 放首参数，error 放最后返回值。
-4. TypeScript 使用 strict、ESM、const/let、严格相等；不使用 any、非空断言和空 catch 绕过类型检查。
-5. React 使用函数组件和 hooks；完整处理加载、空数据、权限失败、过期、错误和重试状态。
-6. 时间统一存 UTC，前端按用户时区显示；所有数字都带单位和来源。
-7. Prompt、回答、代码、工具参数、完整请求体不得写入数据库、日志、审计、导出或截图。
-8. 外部 HTTP 请求必须有超时、取消、响应大小限制、重定向边界和有限重试。
-9. 不得使用原项目的全局配置、数据库、端口、登录体系或常驻服务作为运行依赖。
-10. 不得用注释、mock 测试或文件存在来代替真实验收证据。
-
-四、每项任务完成时必须执行
-
-1. `./build/test.sh`
-2. `./build/build.sh`
-3. `./build/smoke-test.sh`
-4. 相关 Go 包的单测、集成测试和必要的 race 测试。
-5. 涉及界面的真实浏览器验证：桌面 1440×900、移动 390×844。
-6. 涉及真实 Provider 或 Coding 工具时，记录客户端版本、Provider、Connector 版本、测试时间和脱敏结果。
-7. 在 `outputs/validation/MR-NNN-YYYY-MM-DD.md` 保存证据。
-8. 只有全部验收条件满足后，才将清单中的 `[ ]` 改成 `[x]`，并同步 README 的里程碑状态。
-
-五、最终输出格式
-
-完成任务后，请输出：
-
-- 本次完成的 MR 编号和具体行为。
-- 修改的文件。
-- 数据库 migration 版本。
-- 测试和浏览器验证命令、结果和退出码。
-- 真实 Provider/Coding 工具版本及是否有真实凭据。
-- 已知限制和未完成验收项。
-- 对应的 outputs/validation 文件路径。
-
-如果缺少真实凭据、官方接口或平台权限，继续完成不依赖这些条件的代码、mock、fixture、错误状态和文档；把真实验收标记为“待真实凭据”，不能伪造通过。
+交付时说明：完成的 MR 子项、修改文件、migration 是否变化、测试结果、真实凭据/客户端验收边界、遗留项及证据路径。
